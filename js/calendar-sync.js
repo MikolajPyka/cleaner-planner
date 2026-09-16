@@ -37,6 +37,7 @@ const PAST_WINDOW_DAYS = 14;
 const FUTURE_WINDOW_DAYS = 45;
 const CATALOG_ANCHOR_DATE = '2000-01-01'; // sentinel — nigdy nie wpada w normalny widok appki/Kalendarza
 const CHUNK_SIZE = 900; // margines poniżej limitu API (1024 znaków na wartość właściwości)
+const CONCURRENCY = 6; // ile zapytań do Calendar API naraz w reconcileOccurrences (patrz mapWithConcurrency)
 
 // Przybliżona paleta colorId Google Calendar (11 stałych kolorów) — używana tylko
 // żeby wystąpienia w Kalendarzu miały kolor zbliżony do koloru kategorii w appce.
@@ -121,6 +122,28 @@ async function apiFetch(path, options = {}) {
 
 function eventsPath(calendarId, suffix = '') {
   return `/calendars/${encodeURIComponent(calendarId)}/events${suffix}`;
+}
+
+// Google Calendar API v3 nie ma już wspólnego endpointu do zapytań wsadowych, ale
+// limit 600 zapytań/min/użytkownika (patrz architektura) daje mnóstwo zapasu na
+// kilka równoległych zapytań naraz. `reconcileOccurrences` potrafi mieć dziesiątki
+// wystąpień do zaktualizowania (np. gdy dołącza drugi domownik i zmienia się
+// przypisanie w każdym z nich) — robienie tego sekwencyjnie, jedno po drugim,
+// potrafiło sumarycznie trwać dłużej niż jakikolwiek rozsądny limit czasu na wolnym
+// mobilnym internecie (to NIE było zawieszenie, appka naprawdę pracowała, tylko
+// zbyt wolno). `mapWithConcurrency` uruchamia najwyżej `limit` zapytań naraz.
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  async function worker() {
+    while (true) {
+      const i = nextIndex++;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
 }
 
 async function listAllPages(calendarId, params) {
@@ -262,6 +285,10 @@ async function reconcileOccurrences() {
   const eventMap = store.getOccurrenceEventMap();
   const seenKeys = new Set();
 
+  // Zbieramy najpierw listę "zadań" do wykonania, potem wysyłamy je równolegle
+  // (limit CONCURRENCY naraz) zamiast jedno po drugim — patrz komentarz przy
+  // mapWithConcurrency wyżej.
+  const tasks = [];
   for (const occ of occurrences) {
     const chore = chores.find((c) => c.id === occ.choreId);
     if (!chore) continue;
@@ -273,22 +300,25 @@ async function reconcileOccurrences() {
     const member = members.find((m) => m.id === assigneeId) || null;
     const body = occurrenceEventBody(chore, occ.date, category, member, override);
     const existingId = eventMap[key];
-    try {
-      if (existingId) {
-        await apiFetch(eventsPath(calendarId, `/${existingId}`), { method: 'PATCH', body: JSON.stringify(body) });
-      } else {
-        const created = await apiFetch(eventsPath(calendarId), { method: 'POST', body: JSON.stringify(body) });
-        store.setOccurrenceEventId(chore.id, dateKey(occ.date), created.id);
+    tasks.push(async () => {
+      try {
+        if (existingId) {
+          await apiFetch(eventsPath(calendarId, `/${existingId}`), { method: 'PATCH', body: JSON.stringify(body) });
+        } else {
+          const created = await apiFetch(eventsPath(calendarId), { method: 'POST', body: JSON.stringify(body) });
+          store.setOccurrenceEventId(chore.id, dateKey(occ.date), created.id);
+        }
+      } catch (err) {
+        console.error('Nie udało się zsynchronizować wystąpienia', key, err);
       }
-    } catch (err) {
-      console.error('Nie udało się zsynchronizować wystąpienia', key, err);
-    }
+    });
   }
+  await mapWithConcurrency(tasks, CONCURRENCY, (task) => task());
 
   // Wydarzenia w mapie, których wystąpienie już nie istnieje w oknie (np. obowiązek
   // dezaktywowany/usunięty, albo dla 'rolling' termin przesunął się dalej) — usuwamy.
-  for (const key of Object.keys(eventMap)) {
-    if (seenKeys.has(key)) continue;
+  const deleteTasks = Object.keys(eventMap).filter((key) => !seenKeys.has(key));
+  await mapWithConcurrency(deleteTasks, CONCURRENCY, async (key) => {
     const [choreId, dk] = key.split('|');
     try {
       await apiFetch(eventsPath(calendarId, `/${eventMap[key]}`), { method: 'DELETE' });
@@ -296,7 +326,7 @@ async function reconcileOccurrences() {
       // 410/404 = już usunięte po drugiej stronie, to nie jest błąd
     }
     store.deleteOccurrenceEventId(choreId, dk);
-  }
+  });
 }
 
 /** Ściąga z kalendarza statusy wystąpień w oknie synchronizacji (np. zmienione przez
@@ -354,7 +384,7 @@ export function isConfigured() {
 // zresetuje flagę `syncing` i pokaże błąd zamiast trzymać appkę w "Synchronizuję..."
 // bez końca i bez możliwości ręcznego ponowienia (przycisk jest zablokowany,
 // dopóki `syncing` jest true).
-const OVERALL_SYNC_TIMEOUT_MS = 25000;
+const OVERALL_SYNC_TIMEOUT_MS = 60000;
 
 function withTimeout(promise, ms, code) {
   return new Promise((resolve, reject) => {
