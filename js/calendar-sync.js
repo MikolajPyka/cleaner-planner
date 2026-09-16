@@ -92,10 +92,19 @@ function decodeChunks(props) {
 
 // ---------- Niskopoziomowe wywołania Calendar API ----------
 
+// Limit czasu na POJEDYNCZE zapytanie sieciowe do Calendar API. Bez tego pojedynczy
+// utknięty fetch (np. telefon w trybie doze, przełączenie WiFi/komórkowe w trakcie
+// requestu) blokował całą synchronizację bez końca, bo fetch() sam z siebie nie ma
+// żadnego wbudowanego limitu czasu (zweryfikowany realny problem po pierwszym
+// wdrożeniu poprawki dla getAccessToken — ten sam rodzaj zawieszenia mógł wystąpić
+// też tutaj, nie tylko przy cichej odnowie tokenu).
+const REQUEST_TIMEOUT_MS = 15000;
+
 async function apiFetch(path, options = {}) {
   const token = await getAccessToken();
   const res = await fetch(`${API_BASE}${path}`, {
     ...options,
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     headers: {
       Authorization: `Bearer ${token}`,
       ...(options.body ? { 'Content-Type': 'application/json' } : {}),
@@ -337,6 +346,26 @@ export function isConfigured() {
   return !!store.getCalendarId();
 }
 
+// Watchdog na CAŁĄ operację push/pull, niezależny od pojedynczych timeoutów fetchy
+// (REQUEST_TIMEOUT_MS w apiFetch, timeout w getAccessToken). To ostatnia linia
+// obrony: gdyby COKOLWIEK w łańcuchu wywołań utknęło w sposób, którego nie
+// przewidzieliśmy (np. pętla paginacji, przeglądarka usypia kartę w trakcie
+// requestu), ten watchdog i tak po pewnym czasie odda kontrolę z powrotem,
+// zresetuje flagę `syncing` i pokaże błąd zamiast trzymać appkę w "Synchronizuję..."
+// bez końca i bez możliwości ręcznego ponowienia (przycisk jest zablokowany,
+// dopóki `syncing` jest true).
+const OVERALL_SYNC_TIMEOUT_MS = 25000;
+
+function withTimeout(promise, ms, code) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(code)), ms);
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (err) => { clearTimeout(timer); reject(err); }
+    );
+  });
+}
+
 /** Pociągnięte po starcie appki / focusie okna / co jakiś czas — nigdy nie wypycha
  * lokalnych zmian, tylko sprowadza to, co zmieniło się po drugiej stronie. */
 export async function pullRemote() {
@@ -345,9 +374,11 @@ export async function pullRemote() {
   syncing = true;
   notifyStatus('syncing');
   try {
-    await pullCatalog(calendarId);
-    await pullOccurrences(calendarId);
-    await reconcileOccurrences(); // domyka nowe/zmienione obowiązki z pociągniętego katalogu
+    await withTimeout((async () => {
+      await pullCatalog(calendarId);
+      await pullOccurrences(calendarId);
+      await reconcileOccurrences(); // domyka nowe/zmienione obowiązki z pociągniętego katalogu
+    })(), OVERALL_SYNC_TIMEOUT_MS, 'sync-timeout');
     notifyStatus('ok', { at: new Date().toISOString() });
   } catch (err) {
     console.error('Synchronizacja (pull) nie powiodła się', err);
@@ -366,8 +397,10 @@ async function doPush() {
   syncing = true;
   notifyStatus('syncing');
   try {
-    await pushCatalog();
-    await reconcileOccurrences();
+    await withTimeout((async () => {
+      await pushCatalog();
+      await reconcileOccurrences();
+    })(), OVERALL_SYNC_TIMEOUT_MS, 'sync-timeout');
     notifyStatus('ok', { at: new Date().toISOString() });
   } catch (err) {
     console.error('Synchronizacja (push) nie powiodła się', err);
@@ -385,8 +418,13 @@ function pushLocal() {
 
 function describeError(err) {
   const msg = err?.message || '';
+  const name = err?.name || '';
   if (msg === 'reauth-required') return 'Sesja Google wygasła — zaloguj się ponownie w Koncie, żeby wznowić synchronizację.';
   if (msg === 'token-timeout') return 'Odświeżenie sesji Google nie odpowiedziało na czas — spróbuj "Synchronizuj teraz" jeszcze raz, a jeśli to nie pomoże, zaloguj się ponownie w Koncie.';
+  if (msg === 'sync-timeout') return 'Synchronizacja trwała zbyt długo i została przerwana — sprawdź internet i spróbuj "Synchronizuj teraz" jeszcze raz.';
+  if (name === 'TimeoutError' || name === 'AbortError' || msg.includes('aborted') || msg.includes('signal')) {
+    return 'Połączenie z Google Calendar przerwane (za wolny internet) — spróbuj ponownie.';
+  }
   if (msg.startsWith('calendar-api-404')) return 'Nie znaleziono kalendarza — sprawdź, czy ID kalendarza w Koncie jest poprawne.';
   if (msg.startsWith('calendar-api-403')) return 'Brak dostępu do kalendarza — sprawdź, czy jest udostępniony temu kontu Google z prawem edycji.';
   return 'Nie udało się zsynchronizować z Google Calendar. Sprawdź internet i spróbuj ponownie.';
