@@ -11,6 +11,7 @@ import {
 import { computeDashboardStats } from './gamification.js';
 import { svgIcon, googleLogoSvg, CATEGORY_ICON_CHOICES } from './icons.js';
 import { signInWithGoogle, isGoogleSignInConfigured } from './google-auth.js';
+import * as calendarSync from './calendar-sync.js';
 
 // ---------- Stałe i pomocnicze formatery ----------
 
@@ -212,6 +213,10 @@ const ui = {
   loginGoogleNoteText: 'Logowanie Google wymaga jeszcze skonfigurowania projektu w Google Cloud Console (Faza 2 — patrz README). Na razie kontynuuj lokalnie — dane zostaną na tym urządzeniu.',
   googleSignInBusy: false, // true w trakcie okna zgody Google (blokuje podwójne kliknięcie)
   choreFilter: 'all', // 'all' | 'fixed' | 'rolling' (filtr trybu harmonogramu w Obowiązkach)
+  syncStatus: 'idle', // 'idle' | 'syncing' | 'ok' | 'error' (synchronizacja z Google Calendar, Faza 2 krok 2)
+  syncMessage: '',
+  syncedAt: null,
+  calendarIdDraft: null, // stan roboczy pola "ID kalendarza" w Koncie, dopóki nieedytowane: null
 };
 
 // ---------- Motyw ----------
@@ -728,6 +733,65 @@ function renderCategoriesView() {
 
 // ---------- Widok: Konto ----------
 
+/** Sekcja "Kalendarz" w Koncie — konfiguracja ID współdzielonego kalendarza Google
+ * i status synchronizacji (Faza 2, krok 2). Bez logowania przez Google nieaktywna —
+ * synchronizacja wymaga zakresu Calendar, który appka prosi dopiero przy logowaniu
+ * Google (patrz google-auth.js). */
+function renderCalendarSyncSection(isGoogle) {
+  if (!isGoogle) {
+    return `
+      <div class="status-row">
+        ${categoryIconChip({ colorHex: '#6B7280', icon: 'calendar' }, 40)}
+        <div class="spacer">
+          <div style="font-size:14.5px;font-weight:700">Brak połączenia</div>
+          <div class="row" style="gap:6px;margin-top:2px">
+            <span class="status-dot is-pending"></span>
+            <span class="text-sm text-secondary">Zaloguj się przez Google, żeby podłączyć wspólny kalendarz</span>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  const calendarId = store.getCalendarId();
+  const editing = ui.calendarIdDraft !== null;
+
+  if (!calendarId || editing) {
+    return `
+      <div class="stack" style="gap:8px">
+        <label class="field-label" for="calendarIdInput">ID kalendarza Google</label>
+        <input id="calendarIdInput" type="text" placeholder="np. abc123@group.calendar.google.com"
+          value="${escapeHtml(ui.calendarIdDraft ?? '')}" data-action="save-calendar-id" />
+        <p class="hint" style="margin:0">Znajdziesz je w Google Calendar: Ustawienia → wybierz kalendarz (np. "cleaner") → "Identyfikator kalendarza". Musisz mieć do niego dostęp z prawem edycji.</p>
+        ${calendarId ? `<button type="button" class="btn btn-outline btn-block" data-action="cancel-calendar-edit">Anuluj</button>` : ''}
+      </div>`;
+  }
+
+  const dotClass = ui.syncStatus === 'error' ? 'is-error' : ui.syncStatus === 'syncing' ? 'is-syncing' : 'is-connected';
+  const statusText = ui.syncStatus === 'error'
+    ? (ui.syncMessage || 'Błąd synchronizacji')
+    : ui.syncStatus === 'syncing'
+      ? 'Synchronizuję…'
+      : ui.syncedAt
+        ? `Zsynchronizowano o ${new Date(ui.syncedAt).toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit' })}`
+        : 'Podłączono — czekam na pierwszą synchronizację';
+
+  return `
+    <div class="status-row">
+      ${categoryIconChip({ colorHex: '#4C6B57', icon: 'calendar' }, 40)}
+      <div class="spacer">
+        <div style="font-size:14.5px;font-weight:700">${escapeHtml(calendarId)}</div>
+        <div class="row" style="gap:6px;margin-top:2px">
+          <span class="status-dot ${dotClass}"></span>
+          <span class="text-sm text-secondary">${escapeHtml(statusText)}</span>
+        </div>
+      </div>
+    </div>
+    <div class="row" style="gap:8px;margin-top:10px">
+      <button type="button" class="btn btn-outline" style="flex:1" data-action="sync-now" ${ui.syncStatus === 'syncing' ? 'disabled' : ''}>Synchronizuj teraz</button>
+      <button type="button" class="btn btn-outline" data-action="edit-calendar-id">Zmień</button>
+    </div>`;
+}
+
 function renderAccountView() {
   const session = store.getSession();
   const members = store.getMembers();
@@ -774,16 +838,7 @@ function renderAccountView() {
 
       <div class="section">
         <div class="section-label">Kalendarz</div>
-        <div class="status-row">
-          ${categoryIconChip({ colorHex: '#4C6B57', icon: 'calendar' }, 40)}
-          <div class="spacer">
-            <div style="font-size:14.5px;font-weight:700">Sprzątanie — dom</div>
-            <div class="row" style="gap:6px;margin-top:2px">
-              <span class="status-dot is-pending"></span>
-              <span class="text-sm text-secondary">${isGoogle ? 'Zalogowano przez Google — synchronizacja z Kalendarzem to kolejny krok' : 'Brak połączenia — dostępne od Fazy 2'}</span>
-            </div>
-          </div>
-        </div>
+        ${renderCalendarSyncSection(isGoogle)}
       </div>
 
       <div class="section">
@@ -1119,6 +1174,7 @@ function handleClick(e) {
         .then((profile) => {
           store.setSession({ mode: 'google', name: profile.name, email: profile.email, picture: profile.picture });
           linkGoogleIdentityToMember(profile);
+          maybeInitCalendarSync();
           ui.googleSignInBusy = false;
           ui.route = 'app';
           render();
@@ -1155,6 +1211,17 @@ function handleClick(e) {
       store.setThemePreference(el.dataset.value);
       applyTheme();
       render();
+      return;
+    case 'edit-calendar-id':
+      ui.calendarIdDraft = store.getCalendarId() || '';
+      render();
+      return;
+    case 'cancel-calendar-edit':
+      ui.calendarIdDraft = null;
+      render();
+      return;
+    case 'sync-now':
+      calendarSync.syncNow();
       return;
     case 'logout':
       if (confirm('Wylogować się z aplikacji? Zapisane obowiązki zostaną nietknięte.')) {
@@ -1369,6 +1436,12 @@ function handleChange(e) {
     store.setOccurrenceStatus(choreid, date, status, { assigneeId: e.target.value || null });
     render();
   }
+  if (e.target.dataset.action === 'save-calendar-id') {
+    store.setCalendarId(e.target.value);
+    ui.calendarIdDraft = null;
+    if (store.getCalendarId()) calendarSync.connect();
+    render();
+  }
 }
 
 function handleSubmit(e) {
@@ -1422,10 +1495,29 @@ function inferFrequencyTier(draft) {
 
 // ---------- Init ----------
 
+/** Uruchamia synchronizację z Google Calendar (Faza 2, krok 2), jeśli konto jest
+ * zalogowane przez Google i ma ustawione ID kalendarza w Koncie. Bezpieczne do
+ * wołania wielokrotnie — calendarSync.init() samo pilnuje, żeby nie podpiąć się
+ * dwa razy. */
+function maybeInitCalendarSync() {
+  const session = store.getSession();
+  if (session?.mode === 'google' && calendarSync.isConfigured()) {
+    calendarSync.init();
+  }
+}
+
 function init() {
   store.ensureDemoData();
   applyTheme();
   watchSystemTheme();
+
+  calendarSync.onSyncStatus((status, detail) => {
+    ui.syncStatus = status;
+    ui.syncMessage = detail?.message || '';
+    if (status === 'ok') ui.syncedAt = detail?.at || new Date().toISOString();
+    render();
+  });
+  maybeInitCalendarSync();
 
   ui.route = store.getSession() ? 'app' : 'login';
 

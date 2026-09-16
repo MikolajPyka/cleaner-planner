@@ -2,14 +2,16 @@
 // ładowana z CDN w index.html), w pełni po stronie klienta — appka nie ma i nie będzie
 // mieć własnego backendu (patrz architektura projektu, Faza 2).
 //
-// Zakres na TERAZ: tylko TOŻSAMOŚĆ (imię, e-mail, zdjęcie) do ekranu Logowania/Konta —
-// to wystarcza, żeby "Kontynuuj z Google" było prawdziwym logowaniem, a nie placeholderem.
-// Realna dwukierunkowa synchronizacja obowiązków z Kalendarzem Google to oddzielny,
-// kolejny krok: wymaga dodatkowego zakresu (scope) 'https://www.googleapis.com/auth/calendar'
-// i innej obsługi tokenu (GIS w trybie czysto klienckim NIE daje refresh tokenu — token
-// wygasa po ok. godzinie i appka musi go po cichu odnowić albo poprosić o ponowną zgodę;
-// przy samej tożsamości logowania to nieistotne, bo token jest zużywany raz, od razu po
-// otrzymaniu, tylko do pobrania profilu).
+// STAN: logowanie tożsamościowe (imię, e-mail, zdjęcie) ORAZ zakres Google Calendar
+// (Faza 2, krok 2 — synchronizacja obowiązków z kalendarzem, patrz calendar-sync.js).
+// GIS w trybie czysto klienckim NIE daje refresh tokenu — token dostępu żyje ~1h.
+// Ten moduł trzyma go w pamięci (nie w localStorage — to sekret sesji, ginie przy
+// odświeżeniu strony, wtedy po prostu odnawiamy go po cichu przy pierwszym użyciu)
+// i odnawia go w tle przez requestAccessToken({prompt: ''}) — działa bez pokazywania
+// okna logowania, DOPÓKI zgoda użytkownika jest ważna. WAŻNE ograniczenie: dopóki
+// projekt w Google Cloud Console jest w trybie "Testing" (a nie "In production"),
+// Google unieważnia zgodę na zakresy inne niż podstawowe (a Calendar to taki zakres)
+// po 7 dniach — appka wtedy poprosi o ponowne zalogowanie, to nie jest błąd appki.
 //
 // WYMAGANE PRZED UŻYCIEM NA PRAWDZIWYM URZĄDZENIU: wklej swój Client ID poniżej.
 // Jak go zdobyć: Google Cloud Console → APIs & Services → Credentials → Create Credentials
@@ -22,24 +24,39 @@
 
 export const GOOGLE_CLIENT_ID = '755537342812-qs0t7dfe8anad9qoibgj0j25mbldhfes.apps.googleusercontent.com';
 
-// Na razie tylko tożsamość — bez zakresu kalendarza (patrz komentarz wyżej).
-const IDENTITY_SCOPES = 'openid email profile';
+// Tożsamość + zakres Google Calendar (tylko zdarzenia — appka nie zarządza samymi
+// kalendarzami, tylko wpisami w kalendarzu, który użytkownik sam utworzył i którego
+// ID poda w Koncie, patrz calendar-sync.js). Rozszerzenie zakresu oznacza, że każde
+// kolejne logowanie (nawet u kogoś, kto logował się wcześniej tylko po tożsamość)
+// poprosi o dodatkową zgodę na dostęp do kalendarza — to oczekiwane, jednorazowe.
+const APP_SCOPES = 'openid email profile https://www.googleapis.com/auth/calendar.events';
 
 let tokenClient = null;
+
+// Token dostępu trzymany w pamięci (nie w localStorage) + moment jego wygaśnięcia,
+// żeby calendar-sync.js mogło poprosić o ważny token bez wiedzy o mechanice GIS.
+let cachedToken = null;
+let cachedTokenExpiresAt = 0; // epoch ms
 
 function ensureTokenClient() {
   if (tokenClient) return tokenClient;
   if (!window.google?.accounts?.oauth2) return null; // biblioteka GIS jeszcze się nie załadowała (brak internetu / CDN zablokowane)
   tokenClient = window.google.accounts.oauth2.initTokenClient({
     client_id: GOOGLE_CLIENT_ID,
-    scope: IDENTITY_SCOPES,
-    callback: () => {}, // nadpisywane per-wywołanie w signInWithGoogle(), poniżej
+    scope: APP_SCOPES,
+    callback: () => {}, // nadpisywane per-wywołanie poniżej
   });
   return tokenClient;
 }
 
 export function isGoogleSignInConfigured() {
   return !!GOOGLE_CLIENT_ID;
+}
+
+function storeToken(response) {
+  cachedToken = response.access_token;
+  // Margines 2 minut, żeby nie korzystać z tokenu tuż przed jego wygaśnięciem.
+  cachedTokenExpiresAt = Date.now() + (Number(response.expires_in || 3600) - 120) * 1000;
 }
 
 /**
@@ -64,6 +81,7 @@ export function signInWithGoogle() {
         reject(new Error(response.error));
         return;
       }
+      storeToken(response);
       try {
         const res = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
           headers: { Authorization: `Bearer ${response.access_token}` },
@@ -76,5 +94,36 @@ export function signInWithGoogle() {
       }
     };
     client.requestAccessToken({ prompt: 'consent' });
+  });
+}
+
+/**
+ * Zwraca ważny token dostępu do wywołań Google Calendar API — z pamięci, jeśli
+ * jeszcze ważny, albo cicho odnowiony (bez okna logowania) przez GIS. Używane przez
+ * calendar-sync.js. Odrzuca z Error('reauth-required'), jeśli cicha odnowa się nie
+ * uda (np. minęło 7 dni w trybie "Testing" projektu Google Cloud, patrz komentarz
+ * na górze pliku) — appka powinna wtedy poprosić o ponowne kliknięcie "Kontynuuj
+ * z Google".
+ */
+export function getAccessToken() {
+  if (cachedToken && Date.now() < cachedTokenExpiresAt) {
+    return Promise.resolve(cachedToken);
+  }
+  return new Promise((resolve, reject) => {
+    const client = ensureTokenClient();
+    if (!client) {
+      reject(new Error('gis-not-loaded'));
+      return;
+    }
+    client.callback = (response) => {
+      if (response.error) {
+        reject(new Error('reauth-required'));
+        return;
+      }
+      storeToken(response);
+      resolve(response.access_token);
+    };
+    // prompt: '' — bez okna logowania, jeśli zgoda użytkownika jest wciąż ważna.
+    client.requestAccessToken({ prompt: '' });
   });
 }

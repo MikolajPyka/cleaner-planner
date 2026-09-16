@@ -11,6 +11,9 @@ const KEYS = {
   theme: 'cp_theme',
   session: 'cp_session', // null (niezalogowany) albo { mode: 'local'|'google', name?, email? }
   seeded: 'cp_seeded_v2',
+  calendarId: 'cp_calendar_id', // ID współdzielonego kalendarza Google (Faza 2, krok 2)
+  occurrenceEvents: 'cp_occurrence_events', // { "choreId|YYYY-MM-DD": googleEventId } — mapa lokalna, patrz calendar-sync.js
+  catalogRemoteVersion: 'cp_catalog_remote_version', // ostatnio pobrany znacznik wersji katalogu z kalendarza
 };
 
 function read(key, fallback) {
@@ -28,6 +31,29 @@ function write(key, value) {
 
 function uid(prefix) {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+}
+
+// ---------- Hook zapisu (dla calendar-sync.js) ----------
+// storage.js celowo NIC nie wie o Google Calendar — zamiast importować calendar-sync.js
+// tutaj (co dałoby cykliczny import: calendar-sync.js i tak musi czytać dane STĄD),
+// wystawia prosty rejestr callbacków wywoływanych po każdym lokalnym zapisie. app.js
+// przy starcie rejestruje w tym miejscu funkcję z calendar-sync.js, jeśli konto jest
+// zalogowane przez Google i ma ustawiony kalendarz (patrz init() w app.js).
+
+const writeHooks = [];
+
+export function onWrite(fn) {
+  writeHooks.push(fn);
+}
+
+function notifyWrite(type, payload) {
+  for (const fn of writeHooks) {
+    try {
+      fn(type, payload);
+    } catch (err) {
+      console.error('storage write hook error', err);
+    }
+  }
 }
 
 // ---------- Kategorie obowiązków ----------
@@ -68,6 +94,7 @@ export function saveCategory(category) {
     categories.push(category);
   }
   write(KEYS.categories, categories);
+  notifyWrite('category', category);
   return category;
 }
 
@@ -78,6 +105,7 @@ export function deleteCategory(id) {
   write(KEYS.categories, getCategories().filter((c) => c.id !== id));
   const chores = getChores().map((c) => (c.categoryId === id ? { ...c, categoryId: null } : c));
   write(KEYS.chores, chores);
+  notifyWrite('category-delete', { id });
   return true;
 }
 
@@ -98,11 +126,13 @@ export function saveMember(member) {
     members.push(member);
   }
   write(KEYS.members, members);
+  notifyWrite('member', member);
   return member;
 }
 
 export function deleteMember(id) {
   write(KEYS.members, getMembers().filter((m) => m.id !== id));
+  notifyWrite('member-delete', { id });
 }
 
 // ---------- Obowiązki (chores) ----------
@@ -134,6 +164,7 @@ export function saveChore(chore) {
     chores.push(chore);
   }
   write(KEYS.chores, chores);
+  notifyWrite('chore', chore);
   return chore;
 }
 
@@ -144,6 +175,7 @@ export function deleteChore(id) {
     if (key.startsWith(`${id}|`)) delete overrides[key];
   }
   write(KEYS.overrides, overrides);
+  notifyWrite('chore-delete', { id });
 }
 
 // ---------- Wystąpienia / statusy wykonania ----------
@@ -175,6 +207,7 @@ export function setOccurrenceStatus(choreId, dateKey, status, extra = {}) {
     ...extra,
   };
   write(KEYS.overrides, overrides);
+  notifyWrite('occurrence', { choreId, dateKey, override: overrides[key] });
 
   const chore = getChore(choreId);
   if (chore && chore.schedule.mode === 'rolling') {
@@ -224,6 +257,68 @@ export function getMyMemberId() {
 export function setMyMemberId(memberId) {
   const session = getSession() || { mode: 'local' };
   setSession({ ...session, memberId });
+}
+
+// ---------- Synchronizacja z Google Calendar (Faza 2, krok 2) ----------
+// Ten blok to jedyne miejsce, które wie o ISTNIENIU synchronizacji z kalendarzem —
+// ale nie o samym Google Calendar API (to wie tylko calendar-sync.js, patrz `onWrite`
+// wyżej). Trzyma: ID kalendarza, do którego appka pisze/z którego czyta, lokalną
+// mapę "który wpis w Kalendarzu odpowiada któremu wystąpieniu" (żeby przy kolejnej
+// synchronizacji aktualizować istniejące wydarzenia zamiast tworzyć duplikaty) oraz
+// znacznik ostatnio pobranej wersji katalogu (domownicy/kategorie/obowiązki), żeby
+// rozstrzygać czy zdalna kopia jest nowsza od lokalnej.
+
+export function getCalendarId() {
+  return read(KEYS.calendarId, '');
+}
+
+export function setCalendarId(id) {
+  write(KEYS.calendarId, (id || '').trim());
+}
+
+export function getOccurrenceEventMap() {
+  return read(KEYS.occurrenceEvents, {});
+}
+
+export function setOccurrenceEventId(choreId, dateKey, googleEventId) {
+  const map = getOccurrenceEventMap();
+  map[overrideKey(choreId, dateKey)] = googleEventId;
+  write(KEYS.occurrenceEvents, map);
+}
+
+export function deleteOccurrenceEventId(choreId, dateKey) {
+  const map = getOccurrenceEventMap();
+  delete map[overrideKey(choreId, dateKey)];
+  write(KEYS.occurrenceEvents, map);
+}
+
+export function getCatalogRemoteVersion() {
+  return read(KEYS.catalogRemoteVersion, null);
+}
+
+export function setCatalogRemoteVersion(version) {
+  write(KEYS.catalogRemoteVersion, version);
+}
+
+/**
+ * Nadpisuje lokalny katalog (domownicy/kategorie/obowiązki) danymi ściągniętymi
+ * z kalendarza, BEZ wywoływania write hooków — to jest strona "pull", więc nie może
+ * z powrotem wywołać push-u do kalendarza (pętla). Statusy wystąpień (`overrides`)
+ * celowo zostają nietknięte — te przychodzą osobno, per wystąpienie, przez
+ * `replaceOverridesForRange`.
+ */
+export function replaceCatalogFromRemote({ members, categories, chores }) {
+  if (members) write(KEYS.members, members);
+  if (categories) write(KEYS.categories, categories);
+  if (chores) write(KEYS.chores, chores);
+}
+
+/** Jak wyżej, ale dla mapy statusów wystąpień w danym oknie dat (merge, nie replace
+ * całości — appka trzyma tylko okno +/- kilkudziesięciu dni w Kalendarzu, starsze
+ * lokalne overrides spoza okna zostają nietknięte). */
+export function mergeOverridesFromRemote(partialOverrides) {
+  const overrides = getOverrides();
+  write(KEYS.overrides, { ...overrides, ...partialOverrides });
 }
 
 // ---------- Migracja starszego modelu danych ----------
