@@ -20,7 +20,7 @@
 // Bez wklejonego Client ID przycisk "Kontynuuj z Google" pokazuje uczciwy komunikat
 // zamiast udawać logowanie.
 
-export const GOOGLE_CLIENT_ID = ''; // <- wklej tutaj, np. '123456789-abc123.apps.googleusercontent.com'
+export const GOOGLE_CLIENT_ID = '755537342812-qs0t7dfe8anad9qoibgj0j25mbldhfes.apps.googleusercontent.com';
 
 // Na razie tylko tożsamość — bez zakresu kalendarza (patrz komentarz wyżej).
 const IDENTITY_SCOPES = 'openid email profile';
