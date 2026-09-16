@@ -115,7 +115,21 @@ export function getAccessToken() {
       reject(new Error('gis-not-loaded'));
       return;
     }
+    // Zabezpieczenie przed zawieszeniem: cicha odnowa (prompt: '') w praktyce
+    // czasem nie wywołuje callbacku wcale (np. zablokowany ukryty iframe GIS na
+    // mobilnej przeglądarce, długie uśpienie karty w tle) — bez tego timeoutu
+    // cała synchronizacja wisiałaby w stanie "syncing" bez końca, bo nic nigdy
+    // by nie odrzuciło ani nie rozwiązało tej obietnicy.
+    let settled = false;
+    const timeoutId = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error('token-timeout'));
+    }, 8000);
     client.callback = (response) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
       if (response.error) {
         reject(new Error('reauth-required'));
         return;

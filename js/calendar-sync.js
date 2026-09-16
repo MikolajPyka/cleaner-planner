@@ -386,6 +386,7 @@ function pushLocal() {
 function describeError(err) {
   const msg = err?.message || '';
   if (msg === 'reauth-required') return 'Sesja Google wygasła — zaloguj się ponownie w Koncie, żeby wznowić synchronizację.';
+  if (msg === 'token-timeout') return 'Odświeżenie sesji Google nie odpowiedziało na czas — spróbuj "Synchronizuj teraz" jeszcze raz, a jeśli to nie pomoże, zaloguj się ponownie w Koncie.';
   if (msg.startsWith('calendar-api-404')) return 'Nie znaleziono kalendarza — sprawdź, czy ID kalendarza w Koncie jest poprawne.';
   if (msg.startsWith('calendar-api-403')) return 'Brak dostępu do kalendarza — sprawdź, czy jest udostępniony temu kontu Google z prawem edycji.';
   return 'Nie udało się zsynchronizować z Google Calendar. Sprawdź internet i spróbuj ponownie.';
