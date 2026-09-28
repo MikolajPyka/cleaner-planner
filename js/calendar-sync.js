@@ -37,7 +37,7 @@ const PAST_WINDOW_DAYS = 14;
 const FUTURE_WINDOW_DAYS = 45;
 const CATALOG_ANCHOR_DATE = '2000-01-01'; // sentinel — nigdy nie wpada w normalny widok appki/Kalendarza
 const CHUNK_SIZE = 900; // margines poniżej limitu API (1024 znaków na wartość właściwości)
-const CONCURRENCY = 6; // ile zapytań do Calendar API naraz w reconcileOccurrences (patrz mapWithConcurrency)
+const CONCURRENCY = 10; // ile zapytań do Calendar API naraz w reconcileOccurrences (patrz mapWithConcurrency)
 
 // Przybliżona paleta colorId Google Calendar (11 stałych kolorów) — używana tylko
 // żeby wystąpienia w Kalendarzu miały kolor zbliżony do koloru kategorii w appce.
@@ -310,14 +310,21 @@ async function reconcileOccurrences() {
         }
       } catch (err) {
         console.error('Nie udało się zsynchronizować wystąpienia', key, err);
+      } finally {
+        syncProgress.done++;
       }
     });
   }
-  await mapWithConcurrency(tasks, CONCURRENCY, (task) => task());
 
   // Wydarzenia w mapie, których wystąpienie już nie istnieje w oknie (np. obowiązek
   // dezaktywowany/usunięty, albo dla 'rolling' termin przesunął się dalej) — usuwamy.
   const deleteTasks = Object.keys(eventMap).filter((key) => !seenKeys.has(key));
+
+  // Diagnostyka na potrzeby ewentualnego "sync-timeout" (patrz describeError) — żeby
+  // wiedzieć DOKŁADNIE ile appka miała do zrobienia i ile zdążyła, zamiast zgadywać.
+  syncProgress.total += tasks.length + deleteTasks.length;
+
+  await mapWithConcurrency(tasks, CONCURRENCY, (task) => task());
   await mapWithConcurrency(deleteTasks, CONCURRENCY, async (key) => {
     const [choreId, dk] = key.split('|');
     try {
@@ -326,6 +333,7 @@ async function reconcileOccurrences() {
       // 410/404 = już usunięte po drugiej stronie, to nie jest błąd
     }
     store.deleteOccurrenceEventId(choreId, dk);
+    syncProgress.done++;
   });
 }
 
@@ -360,6 +368,11 @@ async function pullOccurrences(calendarId) {
 let pushTimer = null;
 let syncing = false;
 const listeners = new Set();
+// Diagnostyka postępu bieżącej synchronizacji — zerowana na starcie każdego
+// pullRemote()/doPush(), wypełniana przez reconcileOccurrences(). Dzięki temu,
+// jeśli appka i tak przekroczy OVERALL_SYNC_TIMEOUT_MS, komunikat błędu może
+// pokazać DOKŁADNIE ile wystąpień zostało, zamiast zgadywać przyczynę.
+let syncProgress = { done: 0, total: 0 };
 
 function notifyStatus(status, detail) {
   for (const fn of listeners) {
@@ -402,6 +415,7 @@ export async function pullRemote() {
   const calendarId = store.getCalendarId();
   if (!calendarId || syncing) return;
   syncing = true;
+  syncProgress = { done: 0, total: 0 };
   notifyStatus('syncing');
   try {
     await withTimeout((async () => {
@@ -425,6 +439,7 @@ async function doPush() {
   const calendarId = store.getCalendarId();
   if (!calendarId || syncing) return;
   syncing = true;
+  syncProgress = { done: 0, total: 0 };
   notifyStatus('syncing');
   try {
     await withTimeout((async () => {
@@ -451,7 +466,10 @@ function describeError(err) {
   const name = err?.name || '';
   if (msg === 'reauth-required') return 'Sesja Google wygasła — zaloguj się ponownie w Koncie, żeby wznowić synchronizację.';
   if (msg === 'token-timeout') return 'Odświeżenie sesji Google nie odpowiedziało na czas — spróbuj "Synchronizuj teraz" jeszcze raz, a jeśli to nie pomoże, zaloguj się ponownie w Koncie.';
-  if (msg === 'sync-timeout') return 'Synchronizacja trwała zbyt długo i została przerwana — sprawdź internet i spróbuj "Synchronizuj teraz" jeszcze raz.';
+  if (msg === 'sync-timeout') {
+    const progress = syncProgress.total ? ` (zdążyła ${syncProgress.done}/${syncProgress.total} wystąpień)` : '';
+    return `Synchronizacja trwała zbyt długo i została przerwana${progress} — sprawdź internet i spróbuj "Synchronizuj teraz" jeszcze raz.`;
+  }
   if (name === 'TimeoutError' || name === 'AbortError' || msg.includes('aborted') || msg.includes('signal')) {
     return 'Połączenie z Google Calendar przerwane (za wolny internet) — spróbuj ponownie.';
   }
@@ -463,7 +481,16 @@ function describeError(err) {
 let initialized = false;
 
 /** Wołane raz przy starcie appki, jeśli sesja to Google i kalendarz jest skonfigurowany
- * (patrz app.js init()). Podpina push-na-każdą-zmianę i uruchamia pierwszy pull. */
+ * (patrz app.js init()). Podpina push-na-każdą-zmianę i uruchamia pierwszy pull.
+ *
+ * ŚWIADOMIE bez stałego interwału (setInterval) — appka miała wcześniej pull co minutę,
+ * ale to sprawiało, że status synchronizacji zmieniał się w trakcie wypełniania
+ * formularza obowiązku i (mimo poprawki w app.js, patrz onSyncStatus) i tak nie ma
+ * uzasadnienia: appka i tak synchronizuje się (1) raz przy starcie (poniżej),
+ * (2) po każdej lokalnej zmianie — patrz `pushLocal`/`onWrite`, oraz (3) gdy appka
+ * wraca na pierwszy plan (visibilitychange/focus) — to naturalne momenty, w których
+ * warto sprawdzić, czy drugi domownik coś zmienił, bez dokładania synchronizacji
+ * "w tle" o dowolnej, niepowiązanej z niczym porze. */
 export function init() {
   if (initialized) return;
   initialized = true;
@@ -472,7 +499,6 @@ export function init() {
     if (document.visibilityState === 'visible') pullRemote();
   });
   window.addEventListener('focus', () => pullRemote());
-  setInterval(() => pullRemote(), 60000); // co minutę, tylko gdy appka jest otwarta
   pullRemote();
 }
 
@@ -481,12 +507,61 @@ export async function syncNow() {
   await pullRemote();
 }
 
-/** Wołane raz, zaraz po tym jak użytkownik po raz pierwszy poda ID kalendarza
- * w Koncie. W odróżnieniu od `init()` (który tylko ciągnie dane z kalendarza),
- * najpierw NATYCHMIAST wypycha lokalny katalog i wystąpienia — bez tego świeżo
- * podłączony, pusty kalendarz nigdy nie dostałby danych, dopóki coś lokalnie się
- * nie zmieni (pull sam z siebie niczego nie tworzy). */
+/** Wołane raz, zaraz po tym jak użytkownik po raz pierwszy poda ID kalendarza w Koncie.
+ *
+ * WCZEŚNIEJ: od razu wypychało lokalny katalog (świeże dane demo tego urządzenia),
+ * dopiero potem ciągnęło z kalendarza. To był błąd — gdy DRUGI domownik podłączał się
+ * do już używanego, współdzielonego kalendarza, jego świeżo wygenerowane dane demo
+ * ("Domownik A"/"Domownik B", te same ID na każdym urządzeniu — patrz storage.js
+ * ensureDemoData) od razu NADPISYWAŁY już poprawnie nazwanych domowników pierwszego
+ * domownika, zanim appka zdążyła cokolwiek stamtąd ściągnąć.
+ *
+ * TERAZ: najpierw SPRAWDZA, czy kalendarz ma już współdzielony katalog. Jeśli tak —
+ * ściąga go (adoptując listę domowników/kategorii/obowiązków drugiej osoby) i DOPIERO
+ * na tej podstawie ustala, którym z (teraz już wspólnych) domowników jest ten, kto
+ * właśnie się podłącza (store.claimMemberForIdentity — dopasowanie po e-mailu z Google,
+ * a w ostateczności zajęcie pierwszego jeszcze niczyjego slotu, patrz komentarz przy
+ * tej funkcji w storage.js). Tylko jeśli kalendarz jest naprawdę pusty (pierwsze w
+ * ogóle połączenie), appka wypycha swój lokalny katalog jako punkt startowy. */
 export async function connect() {
-  await doPush();
+  const calendarId = store.getCalendarId();
+  if (!calendarId || syncing) { init(); return; }
+  syncing = true;
+  syncProgress = { done: 0, total: 0 };
+  notifyStatus('syncing');
+  try {
+    await withTimeout((async () => {
+      const existing = await findCatalogEvent(calendarId);
+      if (existing) {
+        const payload = decodeChunks(existing.extendedProperties?.shared);
+        if (payload) {
+          store.replaceCatalogFromRemote(payload);
+          store.setCatalogRemoteVersion(payload.updatedAt || new Date().toISOString());
+          const session = store.getSession();
+          if (session?.mode === 'google' && (session.email || session.name)) {
+            const before = JSON.stringify(store.getMembers());
+            store.claimMemberForIdentity({ name: session.name, email: session.email });
+            // Jeśli zajęcie tożsamości coś zmieniło (np. dopisało e-mail/nazwę do
+            // wcześniej niczyjego slotu), wypchnij to od razu — inaczej ta zmiana
+            // czekałaby na push dopiero przy następnej lokalnej edycji (init() podpina
+            // push-na-zapis dopiero PO zakończeniu connect()), a drugi domownik do
+            // tego czasu nadal widziałby ten slot jako "Domownik A/B".
+            if (JSON.stringify(store.getMembers()) !== before) await pushCatalog();
+          }
+        }
+        await pullOccurrences(calendarId);
+        await reconcileOccurrences();
+      } else {
+        await pushCatalog();
+        await reconcileOccurrences();
+      }
+    })(), OVERALL_SYNC_TIMEOUT_MS, 'sync-timeout');
+    notifyStatus('ok', { at: new Date().toISOString() });
+  } catch (err) {
+    console.error('Połączenie z kalendarzem nie powiodło się', err);
+    notifyStatus('error', { message: describeError(err) });
+  } finally {
+    syncing = false;
+  }
   init();
 }

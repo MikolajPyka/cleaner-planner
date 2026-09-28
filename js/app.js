@@ -94,52 +94,10 @@ function resolveMyMemberId(members) {
   return id;
 }
 
-// Po realnym zalogowaniu przez Google appka zna imię/e-mail konta — zamiast zostawiać
-// "Kim jesteś" na generycznym domowniku (np. "Użytkownik A" z danych demo/domyślnych),
-// podpina zalogowane konto pod konkretnego domownika:
-// 1) jeśli jakiś domownik ma już zapisany ten e-mail (ponowne logowanie na tym samym
-//    urządzeniu, albo dane były już wcześniej dopasowane) — używamy go bez zmian,
-// 2) inaczej, jeśli nazwa domownika już zgadza się z imieniem i nazwiskiem z Google —
-//    tak samo, tylko dopisujemy e-mail na przyszłość,
-// 3) inaczej PRZEMIANOWUJE domownika, pod którym i tak już jesteś na tym urządzeniu
-//    (resolveMyMemberId — zwykle pierwszy/domyślny wpis) na dane z Google, zamiast
-//    tworzyć osobnego, dodatkowego domownika obok generycznego placeholdera.
-function linkGoogleIdentityToMember(profile) {
-  const members = store.getMembers();
-  const email = (profile.email || '').trim().toLowerCase();
-  const name = (profile.name || '').trim();
-  const nameKey = name.toLowerCase();
-
-  let match = email ? members.find((m) => (m.email || '').trim().toLowerCase() === email) : null;
-  if (!match && nameKey) {
-    match = members.find((m) => (m.name || '').trim().toLowerCase() === nameKey);
-  }
-
-  if (match) {
-    if (email && (match.email || '').trim().toLowerCase() !== email) {
-      store.saveMember({ id: match.id, email: profile.email });
-    }
-    store.setMyMemberId(match.id);
-    return;
-  }
-
-  if (members.length === 0) {
-    const created = store.saveMember({
-      name: name || 'Nowy domownik',
-      email: profile.email || undefined,
-      colorHex: MEMBER_COLORS[0],
-    });
-    store.setMyMemberId(created.id);
-    return;
-  }
-
-  const currentId = resolveMyMemberId(members);
-  const patch = { id: currentId };
-  if (name) patch.name = name;
-  if (profile.email) patch.email = profile.email;
-  store.saveMember(patch);
-  store.setMyMemberId(currentId);
-}
+// Dopasowanie zalogowanego konta Google do konkretnego domownika (store.claimMemberForIdentity)
+// — logika przeniesiona do storage.js, bo calendar-sync.js musi móc wywołać ją PONOWNIE
+// po ściągnięciu współdzielonego katalogu z kalendarza (patrz komentarz przy tej funkcji
+// w storage.js), a nie tylko raz, zaraz po zalogowaniu.
 
 function formatDayHeading(date, today) {
   if (sameDay(date, today)) return 'Dziś';
@@ -1173,7 +1131,7 @@ function handleClick(e) {
       signInWithGoogle()
         .then((profile) => {
           store.setSession({ mode: 'google', name: profile.name, email: profile.email, picture: profile.picture });
-          linkGoogleIdentityToMember(profile);
+          store.claimMemberForIdentity(profile);
           maybeInitCalendarSync();
           ui.googleSignInBusy = false;
           ui.route = 'app';
@@ -1515,7 +1473,15 @@ function init() {
     ui.syncStatus = status;
     ui.syncMessage = detail?.message || '';
     if (status === 'ok') ui.syncedAt = detail?.at || new Date().toISOString();
-    render();
+    // Status synchronizacji jest widoczny wyłącznie w Koncie (renderCalendarSyncSection) —
+    // re-renderowanie całej strony (a zwłaszcza renderModal(), które podmienia CAŁY DOM
+    // modala) za każdym razem, gdy status się zmienia, i tak byłoby niewidoczne w innych
+    // widokach, a przy otwartym modalu (np. w trakcie wypełniania formularza obowiązku)
+    // realnie kasowało wpisywany tekst i przewijało ekran do góry. Stan `ui` i tak jest
+    // czytany na bieżąco przy każdym kolejnym renderze, więc pominięcie renderu tutaj
+    // niczego nie gubi — najwyżej wskaźnik statusu odświeży się dopiero przy najbliższej
+    // innej akcji (otwarcie/zamknięcie Konta, zamknięcie modala itd.).
+    if (!ui.modal) render();
   });
   maybeInitCalendarSync();
 

@@ -259,6 +259,64 @@ export function setMyMemberId(memberId) {
   setSession({ ...session, memberId });
 }
 
+// Po realnym zalogowaniu przez Google appka zna imię/e-mail konta — zamiast zostawiać
+// "Kim jesteś" na generycznym domowniku (np. "Domownik A" z danych demo), podpina
+// zalogowane konto pod konkretnego domownika. Wołane: (1) od razu po zalogowaniu,
+// (2) PONOWNIE przez calendar-sync.js po każdym ściągnięciu współdzielonego katalogu
+// z kalendarza — bo dopiero wtedy appka widzi PRAWDZIWĄ, wspólną listę domowników
+// (np. gdy drugi domownik połączył się z kalendarzem wcześniej i to jego dane są tam
+// od początku). Dlatego dopasowanie NIE może polegać na "pierwszy domownik na liście"
+// (to zależy tylko od tego, co akurat wylosowały dane demo NA TYM urządzeniu) — jedyny
+// pewny sygnał "ten domownik nie jest jeszcze niczyj" to brak przypisanego e-maila.
+export function claimMemberForIdentity(profile) {
+  const members = getMembers();
+  const email = (profile.email || '').trim().toLowerCase();
+  const name = (profile.name || '').trim();
+  if (!email && !name) return null;
+
+  // 1) Już wcześniej dopasowany po e-mailu (ponowne logowanie na tym samym
+  //    urządzeniu, albo ta tożsamość była już dopasowana wcześniej) — użyj bez zmian.
+  let match = email ? members.find((m) => (m.email || '').trim().toLowerCase() === email) : null;
+
+  // 2) Jeszcze niczyj (brak e-maila) domownik o nazwie już zgadzającej się z Google —
+  //    tylko wśród nieprzypisanych, żeby przypadkowa zgodność nazw nie podkradła
+  //    slotu, który jest już czyjś.
+  if (!match && name) {
+    match = members.find((m) => !m.email && (m.name || '').trim().toLowerCase() === name.toLowerCase());
+  }
+
+  if (match) {
+    const patch = { id: match.id };
+    if (email && (match.email || '').trim().toLowerCase() !== email) patch.email = profile.email;
+    if (name && !match.email) patch.name = name; // nadpisz nazwę tylko dopóki slot jest jeszcze niczyj
+    if (Object.keys(patch).length > 1) saveMember(patch);
+    setMyMemberId(match.id);
+    return match.id;
+  }
+
+  // 3) Żaden domownik nie jest jeszcze Tobą — zajmij pierwszy NIEPRZYPISANY slot
+  //    (bez e-maila). To naprawia sytuację, w której obaj domownicy startowali z
+  //    identycznych lokalnych danych demo (te same ID "member_a"/"member_b" na
+  //    każdym urządzeniu) i mogliby inaczej oboje "podpiąć się" pod tego samego
+  //    (pierwszego) domownika.
+  const unclaimed = members.find((m) => !m.email);
+  if (unclaimed) {
+    saveMember({ id: unclaimed.id, name: name || unclaimed.name, email: profile.email || undefined });
+    setMyMemberId(unclaimed.id);
+    return unclaimed.id;
+  }
+
+  // 4) Brak wolnych slotów (obaj już przypisani, do kogo innego) — dołóż nowego
+  //    domownika zamiast przejmować cudzy.
+  const created = saveMember({
+    name: name || 'Nowy domownik',
+    email: profile.email || undefined,
+    colorHex: members.length % 2 === 0 ? '#4C6B57' : '#B45309',
+  });
+  setMyMemberId(created.id);
+  return created.id;
+}
+
 // ---------- Synchronizacja z Google Calendar (Faza 2, krok 2) ----------
 // Ten blok to jedyne miejsce, które wie o ISTNIENIU synchronizacji z kalendarzem —
 // ale nie o samym Google Calendar API (to wie tylko calendar-sync.js, patrz `onWrite`
