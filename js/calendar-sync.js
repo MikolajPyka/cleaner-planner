@@ -181,6 +181,7 @@ export async function pushCatalog() {
     members: store.getMembers(),
     categories: store.getCategories(),
     chores: store.getChores(),
+    templates: store.getTemplates(), // biblioteka szablonów obowiązków — patrz storage.js
     updatedAt: new Date().toISOString(),
   };
   const existing = await findCatalogEvent(calendarId);

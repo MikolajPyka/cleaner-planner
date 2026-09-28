@@ -14,6 +14,8 @@ const KEYS = {
   calendarId: 'cp_calendar_id', // ID współdzielonego kalendarza Google (Faza 2, krok 2)
   occurrenceEvents: 'cp_occurrence_events', // { "choreId|YYYY-MM-DD": googleEventId } — mapa lokalna, patrz calendar-sync.js
   catalogRemoteVersion: 'cp_catalog_remote_version', // ostatnio pobrany znacznik wersji katalogu z kalendarza
+  templates: 'cp_templates', // biblioteka szablonów obowiązków (patrz "Szablony" niżej)
+  templatesSeeded: 'cp_templates_seeded_v1',
 };
 
 function read(key, fallback) {
@@ -56,18 +58,56 @@ function notifyWrite(type, payload) {
   }
 }
 
-// ---------- Kategorie obowiązków ----------
+// ---------- Kategorie obowiązków = POMIESZCZENIA (zmienione 28.09.2026) ----------
 // Osobny byt od trybu harmonogramu — patrz "System kategorii" w architekturze projektu.
-// 6 wbudowanych + dowolne dodane przez użytkownika (design system: nazwa + kolor + ikona).
-
+// Do 28.09.2026 kategorie opisywały TYP czynności (Mycie/Odkurzanie/Śmieci/...).
+// Na wyraźną prośbę użytkownika appka przeszła na POMIESZCZENIA (Kuchnia/Łazienka/
+// Salon/Sypialnia/Klatka schodowa + "Inne" jako furtka dla obowiązków bez jednego
+// konkretnego pomieszczenia) — to naturalniejszy sposób grupowania przy korzystaniu
+// z biblioteki Szablonów (patrz niżej), gdzie obowiązki i tak są organizowane per
+// pokój. Kształt danych (id/name/colorHex/icon/builtIn) się nie zmienił — tylko to,
+// CO te 6 wbudowanych wpisów reprezentuje — więc reszta appki (categoryId na
+// obowiązku, CRUD kategorii) działa bez zmian. `kuchnia`/`lazienka`/`inne` celowo
+// zachowują swoje stare ID i kolory (już wcześniej były pomieszczeniami/miały
+// dostrojony kontrast w dark mode) — patrz `migrateToV3()` niżej za to, jak appka
+// przenosi obowiązki istniejących użytkowników z usuniętych kategorii (mycie/
+// odkurzanie/smieci) na te nowe.
 const BUILTIN_CATEGORIES = [
-  { id: 'mycie', name: 'Mycie', colorHex: '#3B7DD8', icon: 'droplet', builtIn: true },
-  { id: 'odkurzanie', name: 'Odkurzanie', colorHex: '#6B7280', icon: 'broom', builtIn: true },
-  { id: 'smieci', name: 'Śmieci', colorHex: '#C0703A', icon: 'trash-2', builtIn: true },
-  { id: 'lazienka', name: 'Łazienka', colorHex: '#7A5C9E', icon: 'sparkle', builtIn: true },
   { id: 'kuchnia', name: 'Kuchnia', colorHex: '#4C6B57', icon: 'utensils', builtIn: true },
-  { id: 'inne', name: 'Inne', colorHex: '#A6862F', icon: 'tag', builtIn: true },
+  { id: 'lazienka', name: 'Łazienka', colorHex: '#7A5C9E', icon: 'sparkle', builtIn: true },
+  { id: 'salon', name: 'Salon', colorHex: '#3B7DD8', icon: 'sofa', builtIn: true },
+  { id: 'sypialnia', name: 'Sypialnia', colorHex: '#A6862F', icon: 'bed', builtIn: true },
+  { id: 'klatka', name: 'Klatka schodowa', colorHex: '#6B7280', icon: 'stairs', builtIn: true },
+  { id: 'inne', name: 'Inne', colorHex: '#C0703A', icon: 'tag', builtIn: true },
 ];
+
+/** Migracja z kategorii-typu-czynności na kategorie-pomieszczenia (28.09.2026).
+ * Wołana bezwarunkowo z `ensureDemoData()` (jak `migrateToV2()`) — sama wykrywa,
+ * czy jest jeszcze co migrować (obecność starych wbudowanych ID), więc jest
+ * bezpieczna do wołania przy każdym starcie appki. Obowiązki wskazujące usunięte
+ * kategorie 'mycie'/'odkurzanie'/'smieci' dostają 'inne' zamiast zostać osierocone
+ * (bez pomieszczenia) — użytkownik może im ręcznie przypisać właściwy pokój.
+ * Własne kategorie dodane wcześniej przez użytkownika (builtIn: false) zostają
+ * nietknięte. */
+function migrateToV3() {
+  const existing = getCategories();
+  const hasOldBuiltins = existing.some((c) => c.builtIn && ['mycie', 'odkurzanie', 'smieci'].includes(c.id));
+  if (!hasOldBuiltins) return;
+
+  const remap = { mycie: 'inne', odkurzanie: 'inne', smieci: 'inne' };
+  let changed = false;
+  const chores = getChores().map((c) => {
+    if (c.categoryId && remap[c.categoryId]) {
+      changed = true;
+      return { ...c, categoryId: remap[c.categoryId] };
+    }
+    return c;
+  });
+  if (changed) write(KEYS.chores, chores);
+
+  const customCategories = existing.filter((c) => !c.builtIn);
+  write(KEYS.categories, [...BUILTIN_CATEGORIES, ...customCategories]);
+}
 
 export function getCategories() {
   return read(KEYS.categories, []);
@@ -317,6 +357,92 @@ export function claimMemberForIdentity(profile) {
   return created.id;
 }
 
+// ---------- Szablony obowiązków (dodane 28.09.2026, na życzenie użytkownika) ----------
+// Gotowe, wstępnie skonfigurowane definicje obowiązków (nazwa + pomieszczenie +
+// harmonogram + szac. czas), pogrupowane wg pomieszczenia — punkt wyjścia do szybkiego
+// "wdrożenia" typowego obowiązku zamiast konfigurowania go od zera za każdym razem.
+// Kształt szablonu to podzbiór pól obowiązku (patrz "Chore" w architekturze) — BEZ
+// `assigneeId` (kto wykonuje to decyzja przy każdym konkretnym obowiązku, nie część
+// presetu) i BEZ `schedule.anchorDate`/`time` (data startowa nie ma sensu w oderwaniu
+// od konkretnego zastosowania — appka wypełnia ją dopiero w formularzu, na dzień
+// dzisiejszy, patrz `makeDraftFromTemplate()` w app.js). Szablony NIE są danymi demo:
+// zostają nawet po "Zresetuj dane demonstracyjne" i są w pełni edytowalne/usuwalne,
+// łącznie z tymi wbudowanymi (`builtIn` to tu tylko informacja, nie ochrona przed
+// edycją/usunięciem — w odróżnieniu od wbudowanych Kategorii/Pomieszczeń).
+
+export function getTemplates() {
+  return read(KEYS.templates, []);
+}
+
+export function saveTemplate(template) {
+  const templates = getTemplates();
+  if (template.id) {
+    const idx = templates.findIndex((t) => t.id === template.id);
+    if (idx >= 0) templates[idx] = { ...templates[idx], ...template };
+    else templates.push(template);
+  } else {
+    template.id = uid('tmpl');
+    template.builtIn = false;
+    templates.push(template);
+  }
+  write(KEYS.templates, templates);
+  notifyWrite('template', template);
+  return template;
+}
+
+export function deleteTemplate(id) {
+  write(KEYS.templates, getTemplates().filter((t) => t.id !== id));
+  notifyWrite('template-delete', { id });
+}
+
+function tmpl(title, categoryId, estimatedMinutes, schedule) {
+  return {
+    id: uid('tmpl'),
+    title,
+    notes: '',
+    checklist: [],
+    estimatedMinutes,
+    categoryId,
+    builtIn: true,
+    schedule: { unit: 'day', interval: 1, weekdays: null, ...schedule },
+  };
+}
+
+/** Zasiewa bibliotekę wbudowanych szablonów RAZ (flaga `templatesSeeded`) — potem
+ * appka zostawia ją w spokoju, żeby nie nadpisywać edycji/usunięć użytkownika przy
+ * każdym starcie. Wołane bezwarunkowo z `ensureDemoData()`, więc dotyczy też osób,
+ * które już korzystają z appki (nie tylko świeżych instalacji). */
+function ensureTemplateSeed() {
+  if (read(KEYS.templatesSeeded, false)) return;
+  const templates = [
+    // Łazienka
+    tmpl('Mycie toalety', 'lazienka', 5, { mode: 'fixed', interval: 2 }),
+    tmpl('Mycie wanny / prysznica', 'lazienka', 10, { mode: 'fixed', interval: 7 }),
+    tmpl('Mycie okien', 'lazienka', 20, { mode: 'rolling', unit: 'month', interval: 3 }),
+    tmpl('Czyszczenie lustra i umywalki', 'lazienka', 5, { mode: 'fixed', interval: 3 }),
+    // Kuchnia
+    tmpl('Mycie podłogi', 'kuchnia', 10, { mode: 'fixed', interval: 3 }),
+    tmpl('Czyszczenie blatów', 'kuchnia', 5, { mode: 'fixed', interval: 1 }),
+    tmpl('Czyszczenie lodówki', 'kuchnia', 20, { mode: 'rolling', unit: 'month', interval: 1 }),
+    tmpl('Wyniesienie śmieci', 'kuchnia', 3, { mode: 'fixed', interval: 2 }),
+    tmpl('Odkamienianie czajnika', 'kuchnia', 10, { mode: 'rolling', unit: 'month', interval: 1 }),
+    // Salon
+    tmpl('Odkurzanie', 'salon', 15, { mode: 'fixed', interval: 3 }),
+    tmpl('Wycieranie kurzu', 'salon', 10, { mode: 'fixed', interval: 7 }),
+    tmpl('Mycie okien', 'salon', 25, { mode: 'rolling', unit: 'month', interval: 3 }),
+    tmpl('Odkurzanie kanapy / tapicerki', 'salon', 15, { mode: 'rolling', unit: 'month', interval: 1 }),
+    // Sypialnia
+    tmpl('Zmiana pościeli', 'sypialnia', 10, { mode: 'fixed', interval: 14 }),
+    tmpl('Odkurzanie', 'sypialnia', 10, { mode: 'fixed', interval: 7 }),
+    tmpl('Wycieranie kurzu', 'sypialnia', 5, { mode: 'fixed', interval: 7 }),
+    // Klatka schodowa
+    tmpl('Mycie schodów / podłogi', 'klatka', 15, { mode: 'fixed', interval: 7 }),
+    tmpl('Wycieranie poręczy i włączników', 'klatka', 5, { mode: 'fixed', interval: 7 }),
+  ];
+  write(KEYS.templates, templates);
+  write(KEYS.templatesSeeded, true);
+}
+
 // ---------- Synchronizacja z Google Calendar (Faza 2, krok 2) ----------
 // Ten blok to jedyne miejsce, które wie o ISTNIENIU synchronizacji z kalendarzem —
 // ale nie o samym Google Calendar API (to wie tylko calendar-sync.js, patrz `onWrite`
@@ -359,16 +485,19 @@ export function setCatalogRemoteVersion(version) {
 }
 
 /**
- * Nadpisuje lokalny katalog (domownicy/kategorie/obowiązki) danymi ściągniętymi
- * z kalendarza, BEZ wywoływania write hooków — to jest strona "pull", więc nie może
- * z powrotem wywołać push-u do kalendarza (pętla). Statusy wystąpień (`overrides`)
- * celowo zostają nietknięte — te przychodzą osobno, per wystąpienie, przez
- * `replaceOverridesForRange`.
+ * Nadpisuje lokalny katalog (domownicy/kategorie/obowiązki/szablony) danymi
+ * ściągniętymi z kalendarza, BEZ wywoływania write hooków — to jest strona "pull",
+ * więc nie może z powrotem wywołać push-u do kalendarza (pętla). Statusy wystąpień
+ * (`overrides`) celowo zostają nietknięte — te przychodzą osobno, per wystąpienie,
+ * przez `replaceOverridesForRange`. `templates` jest opcjonalne w payloadzie (starsze
+ * urządzenia mogły wypchnąć katalog sprzed dodania szablonów) — brak klucza zostawia
+ * lokalną bibliotekę szablonów nietkniętą zamiast ją czyścić.
  */
-export function replaceCatalogFromRemote({ members, categories, chores }) {
+export function replaceCatalogFromRemote({ members, categories, chores, templates }) {
   if (members) write(KEYS.members, members);
   if (categories) write(KEYS.categories, categories);
   if (chores) write(KEYS.chores, chores);
+  if (templates) write(KEYS.templates, templates);
 }
 
 /** Jak wyżej, ale dla mapy statusów wystąpień w danym oknie dat (merge, nie replace
@@ -402,6 +531,8 @@ function migrateToV2() {
 
 export function ensureDemoData() {
   migrateToV2();
+  migrateToV3();
+  ensureTemplateSeed();
   if (read(KEYS.seeded, false)) return;
 
   const today = new Date();
@@ -437,7 +568,7 @@ export function ensureDemoData() {
       checklist: [],
       estimatedMinutes: 20,
       assigneeId: 'member_b',
-      categoryId: 'odkurzanie',
+      categoryId: 'salon',
       frequencyTier: 'frequent',
       schedule: { mode: 'fixed', unit: 'day', interval: 2, weekdays: null, anchorDate: todayKey, time: null },
       active: true,
@@ -467,7 +598,7 @@ export function ensureDemoData() {
       checklist: [],
       estimatedMinutes: 60,
       assigneeId: null,
-      categoryId: 'mycie',
+      categoryId: null, // dotyczy całego mieszkania, bez jednego konkretnego pomieszczenia
       frequencyTier: 'rare',
       schedule: { mode: 'rolling', unit: 'month', interval: 3, weekdays: null, anchorDate: todayKey, time: null },
       active: true,

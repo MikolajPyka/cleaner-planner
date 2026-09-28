@@ -150,7 +150,7 @@ function categoryIconChip(category, size = 44) {
 function categoryBadge(category, schedule) {
   const scheduleText = describeScheduleShort(schedule);
   if (!category) {
-    return `<span class="cat-badge-uncategorized">Bez kategorii · ${scheduleText}</span>`;
+    return `<span class="cat-badge-uncategorized">Bez pomieszczenia · ${scheduleText}</span>`;
   }
   const fg = categoryFg(category.colorHex);
   return `<span class="cat-badge" style="background:${hexToRgba(category.colorHex, tintAlpha())};color:${fg}">${escapeHtml(category.name)} · ${scheduleText}</span>`;
@@ -161,12 +161,14 @@ function categoryBadge(category, schedule) {
 const ui = {
   route: 'login', // 'login' | 'app' — ustalane w init() na podstawie store.getSession()
   tab: 'dashboard', // dashboard | month | chores (zakładki dolnego paska)
-  view: null, // null | 'categories' | 'konto' — pełnoekranowe widoki "pushed" (bez tab bara)
+  view: null, // null | 'categories' | 'templates' | 'konto' — pełnoekranowe widoki "pushed" (bez tab bara)
   monthCursor: startOfToday(),
   selectedDay: null,
   modal: null, // { type: 'occurrence'|'chore', ..., draft: {...} }
-  categoryEditId: null, // id edytowanej kategorii w widoku Kategorie (null = tryb "nowa")
-  categoryDraft: null, // { name, colorHex, icon, builtIn? } — stan roboczy kreatora/edytora kategorii
+  categoryEditId: null, // id edytowanego pomieszczenia w widoku Kategorie/Pomieszczenia (null = tryb "nowa")
+  categoryDraft: null, // { name, colorHex, icon, builtIn? } — stan roboczy kreatora/edytora pomieszczenia
+  templateEditId: null, // id edytowanego szablonu w widoku Szablony (null = tryb "nowy")
+  templateDraft: null, // stan roboczy kreatora/edytora szablonu — patrz makeTemplateDraft()
   loginGoogleNoteVisible: false,
   loginGoogleNoteText: 'Logowanie Google wymaga jeszcze skonfigurowania projektu w Google Cloud Console (Faza 2 — patrz README). Na razie kontynuuj lokalnie — dane zostaną na tym urządzeniu.',
   googleSignInBusy: false, // true w trakcie okna zgody Google (blokuje podwójne kliknięcie)
@@ -227,6 +229,8 @@ function render() {
     html = renderAccountView();
   } else if (ui.view === 'categories') {
     html = renderCategoriesView();
+  } else if (ui.view === 'templates') {
+    html = renderTemplatesView();
   } else if (ui.tab === 'dashboard') {
     html = renderDashboardView();
   } else if (ui.tab === 'month') {
@@ -610,7 +614,7 @@ function renderChoreCard(chore, categories) {
     </button>`;
 }
 
-// ---------- Widok: Kategorie (design system) ----------
+// ---------- Widok: Pomieszczenia (dawniej "Kategorie" — patrz storage.js, 28.09.2026) ----------
 
 function renderCategoriesView() {
   const categories = store.getCategories();
@@ -635,19 +639,19 @@ function renderCategoriesView() {
       <div class="row">
         <button type="button" class="icon-btn icon-btn--sm" data-action="back" aria-label="Wróć">${svgIcon('chevron-left', { size: 16, strokeWidth: 2 })}</button>
         <div>
-          <h1 style="font-size:24px;font-weight:800;letter-spacing:-0.01em">Kategorie</h1>
+          <h1 style="font-size:24px;font-weight:800;letter-spacing:-0.01em">Pomieszczenia</h1>
           <p class="text-sm text-secondary" style="margin-top:2px">Kolor i ikona rozpoznawalne w całej appce</p>
         </div>
       </div>
 
       <div class="section">
-        <div class="section-label">${categories.length} ${categories.length === 1 ? 'kategoria' : 'kategorii'}</div>
+        <div class="section-label">${categories.length} ${categories.length === 1 ? 'pomieszczenie' : 'pomieszczeń'}</div>
         <div class="stack">${legendHtml}</div>
       </div>
 
       <div class="section">
         <div class="row-between">
-          <div class="section-label">${editing ? 'Edycja kategorii' : 'Nowa kategoria'}</div>
+          <div class="section-label">${editing ? 'Edycja pomieszczenia' : 'Nowe pomieszczenie'}</div>
           ${editing ? '<button type="button" class="link-btn" data-action="cancel-category-edit">Anuluj</button>' : ''}
         </div>
 
@@ -660,7 +664,7 @@ function renderCategoriesView() {
 
           <div class="field">
             <label>Nazwa</label>
-            <input type="text" class="input" id="catName" value="${escapeHtml(draft.name)}" placeholder="np. Pranie" ${draft.builtIn ? 'disabled' : ''}>
+            <input type="text" class="input" id="catName" value="${escapeHtml(draft.name)}" placeholder="np. Balkon" ${draft.builtIn ? 'disabled' : ''}>
           </div>
 
           <div class="field">
@@ -681,12 +685,190 @@ function renderCategoriesView() {
             </div>
           </div>
 
-          <button type="button" class="btn btn-primary btn-block" data-action="save-category">${editing ? 'Zapisz zmiany' : 'Dodaj kategorię'}</button>
-          ${editing && !draft.builtIn ? `<button type="button" class="btn btn-danger-ghost btn-block" data-action="delete-category" data-catid="${draft.id}">Usuń kategorię</button>` : ''}
+          <button type="button" class="btn btn-primary btn-block" data-action="save-category">${editing ? 'Zapisz zmiany' : 'Dodaj pomieszczenie'}</button>
+          ${editing && !draft.builtIn ? `<button type="button" class="btn btn-danger-ghost btn-block" data-action="delete-category" data-catid="${draft.id}">Usuń pomieszczenie</button>` : ''}
         </div>
       </div>
     </div>
   `;
+}
+
+// ---------- Widok: Szablony obowiązków (dodane 28.09.2026, na życzenie użytkownika) ----------
+// Biblioteka gotowych, wstępnie skonfigurowanych obowiązków pogrupowana wg pomieszczenia
+// (patrz storage.js) — "Zastosuj" otwiera zwykły formularz dodawania obowiązku
+// (renderChoreFormContent), wstępnie wypełniony danymi szablonu, żeby użytkownik mógł
+// dostosować wykonawcę/datę startową przed zapisaniem (patrz makeDraftFromTemplate niżej;
+// to była jego wyraźna preferencja — szablon nie tworzy obowiązku "w ciemno").
+
+function renderTemplatesView() {
+  const templates = store.getTemplates();
+  const categories = store.getCategories();
+  const editing = !!ui.templateEditId;
+  if (!ui.templateDraft) {
+    ui.templateDraft = editing
+      ? makeTemplateDraft(templates.find((t) => t.id === ui.templateEditId))
+      : makeTemplateDraft(null);
+  }
+  const draft = ui.templateDraft;
+
+  const groups = categories
+    .map((cat) => ({ category: cat, items: templates.filter((t) => t.categoryId === cat.id) }))
+    .filter((g) => g.items.length > 0);
+  const orphaned = templates.filter((t) => !categories.some((c) => c.id === t.categoryId));
+  if (orphaned.length) groups.push({ category: null, items: orphaned });
+
+  const groupsHtml = groups.map((g) => `
+    <div class="section-label" style="margin-top:4px">${g.category ? escapeHtml(g.category.name) : 'Bez pomieszczenia'}</div>
+    <div class="stack" style="margin-bottom:16px">
+      ${g.items.map((t) => templateRow(t, g.category)).join('')}
+    </div>`).join('');
+
+  return `
+    <div class="view view--sheet-like">
+      <div class="row">
+        <button type="button" class="icon-btn icon-btn--sm" data-action="back" aria-label="Wróć">${svgIcon('chevron-left', { size: 16, strokeWidth: 2 })}</button>
+        <div>
+          <h1 style="font-size:24px;font-weight:800;letter-spacing:-0.01em">Szablony obowiązków</h1>
+          <p class="text-sm text-secondary" style="margin-top:2px">Gotowe obowiązki do szybkiego dodania, wg pomieszczeń</p>
+        </div>
+      </div>
+
+      <div class="section">
+        ${templates.length ? groupsHtml : '<p class="hint">Brak szablonów — dodaj pierwszy poniżej.</p>'}
+      </div>
+
+      <div class="section">
+        <div class="row-between">
+          <div class="section-label">${editing ? 'Edycja szablonu' : 'Nowy szablon'}</div>
+          ${editing ? '<button type="button" class="link-btn" data-action="cancel-template-edit">Anuluj</button>' : ''}
+        </div>
+
+        <div class="category-creator">
+          <div class="field">
+            <label for="tplTitle">Nazwa</label>
+            <input type="text" class="input" id="tplTitle" value="${escapeHtml(draft.title)}" placeholder="np. Mycie podłogi">
+          </div>
+
+          <div class="field">
+            <label>Pomieszczenie</label>
+            <div class="chip-group">
+              ${categories.map((cat) => {
+                const selected = draft.categoryId === cat.id;
+                return `<button type="button" class="chip ${selected ? 'is-selected' : ''}" style="${selected ? `background:${cat.colorHex}` : ''}" data-action="select-template-category" data-catid="${cat.id}">${svgIcon(cat.icon, { size: 14, color: selected ? 'currentColor' : categoryFg(cat.colorHex) })}${escapeHtml(cat.name)}</button>`;
+              }).join('')}
+            </div>
+          </div>
+
+          <div class="field">
+            <label>Częstotliwość</label>
+            <div class="segmented-3">
+              <button type="button" class="${draft.scheduleMode === 'fixed' ? 'is-active' : ''}" data-action="set-template-mode" data-mode="fixed">Stały rytm</button>
+              <button type="button" class="${draft.scheduleMode === 'rolling' ? 'is-active' : ''}" data-action="set-template-mode" data-mode="rolling">Od wykonania</button>
+            </div>
+            <p class="hint">${draft.scheduleMode === 'rolling' ? 'Kolejny termin liczony od dnia oznaczenia jako wykonane — dobre dla rzadkich obowiązków.' : 'Stały rytm kalendarzowy, niezależny od wykonania.'}</p>
+          </div>
+
+          <div class="field-row">
+            <div class="field">
+              <label for="tplInterval">Co ile</label>
+              <input class="input" id="tplInterval" type="number" min="1" value="${draft.interval}" style="text-align:center">
+            </div>
+            <div class="field">
+              <label for="tplUnit">Jednostka</label>
+              <select class="select" id="tplUnit">
+                <option value="day" ${draft.unit === 'day' ? 'selected' : ''}>dni</option>
+                <option value="week" ${draft.unit === 'week' ? 'selected' : ''}>tygodni</option>
+                <option value="month" ${draft.unit === 'month' ? 'selected' : ''}>miesięcy</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="field">
+            <label>Szac. czas</label>
+            <div class="stepper">
+              <button type="button" data-action="adjust-template-minutes" data-delta="-5">–</button>
+              <span>${draft.estimatedMinutes} min</span>
+              <button type="button" data-action="adjust-template-minutes" data-delta="5">+</button>
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="tplNotes">Notatka (opcjonalnie)</label>
+            <textarea class="textarea" id="tplNotes" placeholder="Wskazówki widoczne po zastosowaniu szablonu...">${escapeHtml(draft.notes)}</textarea>
+          </div>
+
+          <button type="button" class="btn btn-primary btn-block" data-action="save-template">${editing ? 'Zapisz zmiany' : 'Dodaj szablon'}</button>
+          ${editing ? `<button type="button" class="btn btn-danger-ghost btn-block" data-action="delete-template" data-tplid="${draft.id}">Usuń szablon</button>` : ''}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function templateRow(t, category) {
+  return `
+    <div class="chore-row">
+      <button type="button" class="row spacer" style="border:none;background:none;text-align:left;padding:0;cursor:pointer;color:inherit;font-family:inherit" data-action="edit-template" data-tplid="${t.id}">
+        ${categoryIconChip(category, 44)}
+        <span class="spacer">
+          <span class="chore-title">${escapeHtml(t.title)}</span>
+          <span class="chore-meta"><span>${describeScheduleShort(t.schedule)}</span><span>${t.estimatedMinutes} min</span></span>
+        </span>
+      </button>
+      <button type="button" class="btn btn-outline" style="flex-shrink:0;padding:8px 14px;font-size:13px;white-space:nowrap" data-action="apply-template" data-tplid="${t.id}">Zastosuj</button>
+    </div>`;
+}
+
+function makeTemplateDraft(template) {
+  return {
+    id: template?.id || null,
+    title: template?.title || '',
+    categoryId: template?.categoryId || store.getCategories()[0]?.id || null,
+    scheduleMode: template?.schedule?.mode || 'fixed',
+    unit: template?.schedule?.unit || 'day',
+    interval: template?.schedule?.interval || 1,
+    estimatedMinutes: template?.estimatedMinutes ?? 15,
+    notes: template?.notes || '',
+  };
+}
+
+/** Jak captureChoreFormInputs, ale dla formularza szablonu (patrz ten komentarz przy
+ * captureChoreFormInputs — ten sam powód: zachować właśnie wpisywany tekst przed
+ * częściowym re-renderem wywołanym kliknięciem chipa/segmentu/steppera). */
+function captureTemplateFormInputs() {
+  if (!ui.templateDraft) return;
+  const d = ui.templateDraft;
+  const title = document.getElementById('tplTitle');
+  const interval = document.getElementById('tplInterval');
+  const unit = document.getElementById('tplUnit');
+  const notes = document.getElementById('tplNotes');
+  if (title) d.title = title.value;
+  if (interval) d.interval = Number(interval.value) || d.interval;
+  if (unit) d.unit = unit.value;
+  if (notes) d.notes = notes.value;
+}
+
+/** Buduje draft formularza obowiązku z szablonu — patrz makeChoreDraft(). Data
+ * początkowa jest zawsze "dziś" (szablon sam z siebie nie ma jednej konkretnej daty)
+ * i wykonawca zaczyna jako "Nieprzypisane", żeby użytkownik świadomie go wybrał. */
+function makeDraftFromTemplate(template) {
+  const chore = {
+    title: template.title,
+    notes: template.notes,
+    categoryId: template.categoryId,
+    assigneeId: null,
+    estimatedMinutes: template.estimatedMinutes,
+    checklist: template.checklist || [],
+    schedule: { ...template.schedule, anchorDate: dateKey(startOfToday()), time: '' },
+  };
+  return makeChoreDraft(chore, null);
+}
+
+function openChoreModalFromTemplate(templateId) {
+  const template = store.getTemplates().find((t) => t.id === templateId);
+  if (!template) return;
+  ui.modal = { type: 'chore', choreId: null, presetMode: null, draft: makeDraftFromTemplate(template) };
+  renderModal();
 }
 
 // ---------- Widok: Konto ----------
@@ -820,8 +1002,14 @@ function renderAccountView() {
       </div>
 
       <button type="button" class="status-row" style="cursor:pointer;text-align:left;width:100%;border:1px solid var(--cp-surface-border);font-family:inherit" data-action="open-categories">
+        ${categoryIconChip({ colorHex: '#3B7DD8', icon: 'sofa' }, 40)}
+        <span class="spacer" style="font-size:14.5px;font-weight:700">Pomieszczenia</span>
+        ${svgIcon('chevron-right', { size: 15, color: 'var(--cp-chevron)' })}
+      </button>
+
+      <button type="button" class="status-row" style="cursor:pointer;text-align:left;width:100%;border:1px solid var(--cp-surface-border);font-family:inherit;margin-top:8px" data-action="open-templates">
         ${categoryIconChip({ colorHex: '#A6862F', icon: 'tag' }, 40)}
-        <span class="spacer" style="font-size:14.5px;font-weight:700">Kategorie obowiązków</span>
+        <span class="spacer" style="font-size:14.5px;font-weight:700">Szablony obowiązków</span>
         ${svgIcon('chevron-right', { size: 15, color: 'var(--cp-chevron)' })}
       </button>
 
@@ -930,13 +1118,13 @@ function renderChoreFormContent(choreId, presetMode) {
       </div>
 
       <div class="field">
-        <label>Kategoria</label>
+        <label>Pomieszczenie</label>
         <div class="chip-group">
           ${categories.map((cat) => {
             const selected = draft.categoryId === cat.id;
             return `<button type="button" class="chip ${selected ? 'is-selected' : ''}" style="${selected ? `background:${cat.colorHex}` : ''}" data-action="select-category" data-catid="${cat.id}">${svgIcon(cat.icon, { size: 14, color: selected ? 'currentColor' : categoryFg(cat.colorHex) })}${escapeHtml(cat.name)}</button>`;
           }).join('')}
-          <button type="button" class="chip is-dashed" data-action="new-category-link">${svgIcon('plus', { size: 14, color: 'var(--cp-text-secondary)', strokeWidth: 2 })}Nowa</button>
+          <button type="button" class="chip is-dashed" data-action="new-category-link">${svgIcon('plus', { size: 14, color: 'var(--cp-text-secondary)', strokeWidth: 2 })}Nowe</button>
         </div>
       </div>
 
@@ -1107,6 +1295,8 @@ function handleClick(e) {
       ui.view = null;
       ui.categoryEditId = null;
       ui.categoryDraft = null;
+      ui.templateEditId = null;
+      ui.templateDraft = null;
       render();
       scrollContentTop();
       return;
@@ -1162,6 +1352,13 @@ function handleClick(e) {
       ui.view = 'categories';
       ui.categoryEditId = null;
       ui.categoryDraft = null;
+      render();
+      scrollContentTop();
+      return;
+    case 'open-templates':
+      ui.view = 'templates';
+      ui.templateEditId = null;
+      ui.templateDraft = null;
       render();
       scrollContentTop();
       return;
@@ -1229,12 +1426,75 @@ function handleClick(e) {
       return;
     }
     case 'delete-category':
-      if (confirm('Usunąć tę kategorię? Obowiązki, które jej używają, staną się bez kategorii.')) {
+      if (confirm('Usunąć to pomieszczenie? Obowiązki, które go używają, staną się bez pomieszczenia.')) {
         store.deleteCategory(el.dataset.catid);
         ui.categoryEditId = null;
         ui.categoryDraft = null;
         render();
       }
+      return;
+
+    // ---- Szablony obowiązków ----
+    case 'edit-template':
+      ui.templateEditId = el.dataset.tplid;
+      ui.templateDraft = makeTemplateDraft(store.getTemplates().find((t) => t.id === el.dataset.tplid));
+      render();
+      return;
+    case 'cancel-template-edit':
+      ui.templateEditId = null;
+      ui.templateDraft = null;
+      render();
+      return;
+    case 'select-template-category':
+      captureTemplateFormInputs();
+      ui.templateDraft.categoryId = el.dataset.catid;
+      render();
+      return;
+    case 'set-template-mode':
+      captureTemplateFormInputs();
+      ui.templateDraft.scheduleMode = el.dataset.mode;
+      render();
+      return;
+    case 'adjust-template-minutes': {
+      captureTemplateFormInputs();
+      const delta = Number(el.dataset.delta);
+      ui.templateDraft.estimatedMinutes = Math.max(1, (ui.templateDraft.estimatedMinutes || 15) + delta);
+      render();
+      return;
+    }
+    case 'save-template': {
+      captureTemplateFormInputs();
+      const title = ui.templateDraft.title.trim();
+      if (!title) return;
+      store.saveTemplate({
+        id: ui.templateEditId || undefined,
+        title,
+        categoryId: ui.templateDraft.categoryId,
+        notes: ui.templateDraft.notes,
+        estimatedMinutes: ui.templateDraft.estimatedMinutes,
+        checklist: [],
+        schedule: {
+          mode: ui.templateDraft.scheduleMode,
+          unit: ui.templateDraft.unit,
+          interval: Math.max(1, Number(ui.templateDraft.interval) || 1),
+          weekdays: null,
+        },
+      });
+      ui.templateEditId = null;
+      ui.templateDraft = null;
+      render();
+      return;
+    }
+    case 'delete-template':
+      if (confirm('Usunąć ten szablon?')) {
+        store.deleteTemplate(el.dataset.tplid);
+        ui.templateEditId = null;
+        ui.templateDraft = null;
+        render();
+      }
+      return;
+    case 'apply-template':
+      openChoreModalFromTemplate(el.dataset.tplid);
       return;
 
     // ---- Obowiązki: filtr ----

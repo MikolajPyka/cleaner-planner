@@ -7,7 +7,7 @@
 // w jednym miejscu, ułatwia tę przyszłą podmianę.
 
 const ICONS = {
-  // ---------- Kategorie obowiązków (6 domyślnych) ----------
+  // ---------- Kategorie obowiązków = Pomieszczenia (patrz storage.js, 28.09.2026) ----------
   droplet: '<path d="M12 3s6 7 6 11a6 6 0 0 1-12 0c0-4 6-11 6-11z"/>',
   broom: '<path d="M19 4 9.5 13.5"/><path d="M9.5 13.5c-1.2-1.2-3.4-.8-4.7.5-1.3 1.3-2.3 3.3-2.3 3.3s2 1 3.3 1.7c1.3.7 3.3-.3 4.5-1.5 1.2-1.2 1.6-2.8.5-4z"/>',
   'trash-2': '<path d="M4 7h16"/><path d="M6 7V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v2"/><path d="M6 7l1 13a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-13"/><path d="M10 11v6"/><path d="M14 11v6"/>',
@@ -15,6 +15,10 @@ const ICONS = {
   sparkle: '<path d="M12 3l1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5z"/><path d="M19 15l.7 2 2 .7-2 .7-.7 2-.7-2-2-.7 2-.7z"/>',
   utensils: '<path d="M7 3v6a2 2 0 0 0 4 0V3"/><path d="M9 9v12"/><path d="M17 3c-1 0-2 1-2 3v4c0 1 .5 2 2 2s2-1 2-2V6c0-2-1-3-2-3z"/><path d="M17 12v9"/>',
   tag: '<path d="M20.6 12.6 12 4H4v8l8.6 8.6a2 2 0 0 0 2.8 0l5.2-5.2a2 2 0 0 0 0-2.8z"/><circle cx="8" cy="8" r="1.2" fill="currentColor" stroke="none"/>',
+  // Dodane 28.09.2026 dla nowych pomieszczeń Salon/Sypialnia/Klatka schodowa.
+  sofa: '<path d="M5 12V9a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v3"/><path d="M3 12h18v5a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-5z"/><path d="M5 18v2M19 18v2"/>',
+  bed: '<path d="M2 18v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5"/><path d="M2 15h20"/><rect x="4" y="8" width="6" height="4" rx="1"/><path d="M2 18v2M22 18v2"/>',
+  stairs: '<path d="M3 20v-4h4v-4h4v-4h4V4h6"/><path d="M3 20h18"/>',
 
   // ---------- Dodatkowe ikony do wyboru przy tworzeniu własnej kategorii ----------
   breeze: '<path d="M4 15c2-1 4-1 6 0s4 1 6 0 4-1 4-1M4 10c2-1 4-1 6 0s4 1 6 0 4-1 4-1"/><path d="M7 6a2 2 0 1 1 3 1.7M14 5a2 2 0 1 1 3 1.7"/>',
@@ -58,8 +62,8 @@ export function svgIcon(name, opts = {}) {
 
 /** Nazwy dostępne w kreatorze nowej kategorii (nie wszystkie ikony z ICONS mają tu sens). */
 export const CATEGORY_ICON_CHOICES = [
-  'droplet', 'broom', 'trash', 'sparkle', 'utensils', 'breeze',
-  'box', 'tag', 'shield', 'clock', 'face', 'plus',
+  'droplet', 'broom', 'trash', 'sparkle', 'utensils', 'sofa', 'bed', 'stairs',
+  'breeze', 'box', 'tag', 'shield', 'clock', 'face', 'plus',
 ];
 
 /** Znaczek marki Google (kolory własne, nie stroke) — dla przycisku logowania. */

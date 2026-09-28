@@ -339,6 +339,8 @@ a { color: var(--cp-accent); text-decoration: none; }
 .status-dot { width: 6px; height: 6px; border-radius: var(--radius-full); flex-shrink: 0; }
 .status-dot.is-connected { background: #5B9463; }
 .status-dot.is-pending { background: var(--cp-text-tertiary); }
+.status-dot.is-error { background: var(--cp-danger); }
+.status-dot.is-syncing { background: var(--cp-accent); }
 .member-row-editable { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 12px 14px; border-radius: 16px; background: var(--cp-surface); border: 1px solid var(--cp-surface-border); }
 .member-row-editable input { border: none; background: transparent; padding: 4px; min-height: auto; font-size: 14.5px; font-weight: 700; color: var(--cp-text); min-width: 70px; flex: 1; }
 .member-color-row { display: flex; gap: 6px; flex-basis: 100%; margin-left: 46px; }
