@@ -409,6 +409,24 @@ function withTimeout(promise, ms, code) {
   });
 }
 
+/** Dopasowuje zalogowane konto Google do właściwego domownika na (aktualnej, lokalnej)
+ * liście — patrz store.claimMemberForIdentity. Wołane zarówno z `connect()` (pierwsze
+ * podłączenie kalendarza), jak i z KAŻDEGO `pullRemote()` (start appki / powrót na
+ * pierwszy plan) — to drugie jest ważne jako "samonaprawa" dla urządzeń, które już
+ * były podłączone do kalendarza ZANIM ta poprawka istniała: takie urządzenie nigdy
+ * więcej nie przejdzie przez `connect()` (to dzieje się tylko raz, przy pierwszym
+ * wpisaniu ID kalendarza), więc bez wywołania też tutaj zostałoby z błędnie
+ * przypisaną tożsamością (np. "Domownik A"/"Domownik B") na zawsze. Tania i
+ * bezpieczna operacja w typowym przypadku: gdy e-mail już się zgadza, nie robi
+ * żadnego zapisu (patrz store.claimMemberForIdentity) — więc nie wywołuje pętli
+ * push/pull ani nie miesza się z dopasowaniem drugiego domownika. */
+function reclaimIdentityIfNeeded() {
+  const session = store.getSession();
+  if (session?.mode === 'google' && (session.email || session.name)) {
+    store.claimMemberForIdentity({ name: session.name, email: session.email });
+  }
+}
+
 /** Pociągnięte po starcie appki / focusie okna / co jakiś czas — nigdy nie wypycha
  * lokalnych zmian, tylko sprowadza to, co zmieniło się po drugiej stronie. */
 export async function pullRemote() {
@@ -422,6 +440,7 @@ export async function pullRemote() {
       await pullCatalog(calendarId);
       await pullOccurrences(calendarId);
       await reconcileOccurrences(); // domyka nowe/zmienione obowiązki z pociągniętego katalogu
+      reclaimIdentityIfNeeded(); // samonaprawa dla urządzeń podłączonych przed tą poprawką
     })(), OVERALL_SYNC_TIMEOUT_MS, 'sync-timeout');
     notifyStatus('ok', { at: new Date().toISOString() });
   } catch (err) {
@@ -537,17 +556,14 @@ export async function connect() {
         if (payload) {
           store.replaceCatalogFromRemote(payload);
           store.setCatalogRemoteVersion(payload.updatedAt || new Date().toISOString());
-          const session = store.getSession();
-          if (session?.mode === 'google' && (session.email || session.name)) {
-            const before = JSON.stringify(store.getMembers());
-            store.claimMemberForIdentity({ name: session.name, email: session.email });
-            // Jeśli zajęcie tożsamości coś zmieniło (np. dopisało e-mail/nazwę do
-            // wcześniej niczyjego slotu), wypchnij to od razu — inaczej ta zmiana
-            // czekałaby na push dopiero przy następnej lokalnej edycji (init() podpina
-            // push-na-zapis dopiero PO zakończeniu connect()), a drugi domownik do
-            // tego czasu nadal widziałby ten slot jako "Domownik A/B".
-            if (JSON.stringify(store.getMembers()) !== before) await pushCatalog();
-          }
+          // Jeśli zajęcie tożsamości coś zmieni (np. dopisze e-mail/nazwę do wcześniej
+          // niczyjego slotu), wypchnij to od razu — inaczej ta zmiana czekałaby na push
+          // dopiero przy następnej lokalnej edycji (init() podpina push-na-zapis dopiero
+          // PO zakończeniu connect()), a drugi domownik do tego czasu nadal widziałby
+          // ten slot jako "Domownik A/B".
+          const before = JSON.stringify(store.getMembers());
+          reclaimIdentityIfNeeded();
+          if (JSON.stringify(store.getMembers()) !== before) await pushCatalog();
         }
         await pullOccurrences(calendarId);
         await reconcileOccurrences();
