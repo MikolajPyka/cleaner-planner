@@ -61,24 +61,39 @@ export function computeLevel(points) {
   return { ...current, points, next };
 }
 
+/** Wystąpienie jest "zamknięte", gdy je wykonano albo świadomie pominięto. */
+function isResolved(override) {
+  return override?.status === 'done' || override?.status === 'skipped';
+}
+
+/** Czy dzień wypada w którymś okresie trybu urlopowego ({ from, until } jako 'YYYY-MM-DD'). */
+export function isVacationDay(date, vacations) {
+  if (!vacations?.length) return false;
+  const key = dateKey(date);
+  return vacations.some((v) => key >= v.from && (!v.until || key <= v.until));
+}
+
 /**
  * Liczy passę kolejnych dni, w których wszystkie obowiązki zaplanowane na dany
- * dzień zostały wykonane. Dni bez żadnych zaplanowanych obowiązków nie przerywają
- * passy (po prostu są pomijane). Dzisiejszy, jeszcze niedokończony dzień też jej
- * nie przerywa — liczy się dopiero od jutra wstecz.
+ * dzień zostały wykonane (albo świadomie pominięte). Dni bez żadnych zaplanowanych
+ * obowiązków i dni w trybie urlopowym nie przerywają passy (po prostu są pomijane).
+ * Dzisiejszy, jeszcze niedokończony dzień też jej nie przerywa — liczy się dopiero
+ * od jutra wstecz. Passa jest wspólna dla całego domu.
  */
-export function computeStreak(chores, getOverrideFn) {
+export function computeStreak(chores, getOverrideFn, vacations = []) {
   const today = startOfDay(new Date());
   let streak = 0;
   let cursor = today;
   for (let i = 0; i < 365; i++) {
-    const dayOccs = generateAllOccurrences(chores, cursor, cursor);
+    const dayOccs = isVacationDay(cursor, vacations) ? [] : generateAllOccurrences(chores, cursor, cursor);
     if (dayOccs.length > 0) {
-      const allDone = dayOccs.every((o) => getOverrideFn(o.choreId, dateKey(o.date))?.status === 'done');
-      if (allDone) {
-        streak++;
+      const resolved = dayOccs.filter((o) => isResolved(getOverrideFn(o.choreId, dateKey(o.date))));
+      const anyDone = dayOccs.some((o) => getOverrideFn(o.choreId, dateKey(o.date))?.status === 'done');
+      if (resolved.length === dayOccs.length) {
+        // Dzień z samymi pominięciami nie przerywa passy, ale też jej nie wydłuża.
+        if (anyDone) streak++;
       } else if (i > 0) {
-        break; // dzień (poza dzisiejszym) z niewykonanym obowiązkiem przerywa passę
+        break; // dzień (poza dzisiejszym) z niezamkniętym obowiązkiem przerywa passę
       }
     }
     cursor = addUnits(cursor, 'day', -1);
@@ -90,15 +105,18 @@ export function computeStreak(chores, getOverrideFn) {
  * Podsumowanie na potrzeby dashboardu: dziś/tydzień/passa liczone dla CAŁEGO domu
  * (wspólny postęp dnia), punkty i poziom liczone TYLKO dla `forMemberId` (Twoje —
  * patrz storage.getMyMemberId()), jeśli podano; bez tego (nikt jeszcze nie wybrał
- * "kim jesteś") punkty są wspólne dla domu, tak jak wcześniej.
+ * "kim jesteś") punkty są wspólne dla domu, tak jak wcześniej. Pominięte wystąpienia
+ * nie liczą się ani do wykonanych, ani do wszystkich.
  */
-export function computeDashboardStats(chores, overrides, getOverrideFn, forMemberId = null) {
+export function computeDashboardStats(chores, overrides, getOverrideFn, forMemberId = null, vacations = []) {
   const today = startOfDay(new Date());
   const weekStart = addUnits(today, 'day', -((today.getDay() + 6) % 7)); // poniedziałek
-  const todayOccs = generateAllOccurrences(chores, today, today);
-  const weekOccsSoFar = generateAllOccurrences(chores, weekStart, today);
+  const statusOf = (o) => getOverrideFn(o.choreId, dateKey(o.date))?.status || 'pending';
+  const counted = (occs) => occs.filter((o) => statusOf(o) !== 'skipped' && !isVacationDay(o.date, vacations));
+  const todayOccs = counted(generateAllOccurrences(chores, today, today));
+  const weekOccsSoFar = counted(generateAllOccurrences(chores, weekStart, today));
 
-  const countDone = (occs) => occs.filter((o) => getOverrideFn(o.choreId, dateKey(o.date))?.status === 'done').length;
+  const countDone = (occs) => occs.filter((o) => statusOf(o) === 'done').length;
 
   const points = computeTotalPoints(chores, overrides, forMemberId);
 
@@ -107,7 +125,7 @@ export function computeDashboardStats(chores, overrides, getOverrideFn, forMembe
     todayDone: countDone(todayOccs),
     weekTotal: weekOccsSoFar.length,
     weekDone: countDone(weekOccsSoFar),
-    streak: computeStreak(chores, getOverrideFn),
+    streak: computeStreak(chores, getOverrideFn, vacations),
     points,
     level: computeLevel(points),
   };

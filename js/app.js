@@ -6,9 +6,10 @@
 
 import * as store from './storage.js';
 import {
-  dateKey, parseDateKey, addUnits, generateAllOccurrences, monthGridRange, monthRange,
+  dateKey, parseDateKey, addUnits, generateAllOccurrences, generateOccurrencesInRange, monthGridRange, monthRange,
+  nextOccurrenceDate,
 } from './recurrence.js';
-import { computeDashboardStats } from './gamification.js';
+import { computeDashboardStats, isVacationDay } from './gamification.js';
 import { svgIcon, googleLogoSvg, CATEGORY_ICON_CHOICES } from './icons.js';
 import { signInWithGoogle, isGoogleSignInConfigured } from './google-auth.js';
 import * as calendarSync from './calendar-sync.js';
@@ -19,9 +20,35 @@ const WEEKDAYS_SHORT = ['Pn', 'Wt', 'Śr', 'Cz', 'Pt', 'So', 'Nd'];
 const WEEKDAYS_LONG = ['poniedziałek', 'wtorek', 'środa', 'czwartek', 'piątek', 'sobota', 'niedziela'];
 const MONTHS_GEN = ['stycznia', 'lutego', 'marca', 'kwietnia', 'maja', 'czerwca', 'lipca', 'sierpnia', 'września', 'października', 'listopada', 'grudnia'];
 const MONTHS_NOM = ['Styczeń', 'Luty', 'Marzec', 'Kwiecień', 'Maj', 'Czerwiec', 'Lipiec', 'Sierpień', 'Wrzesień', 'Październik', 'Listopad', 'Grudzień'];
-const FREQUENCY_LABEL = { daily: 'Codzienne', frequent: 'Częste', rare: 'Rzadkie', once: 'Jednorazowe' };
+// Numery dni jak Date.getDay() (0 = niedziela), w kolejności wyświetlania od poniedziałku.
+const WEEKDAY_ORDER = [1, 2, 3, 4, 5, 6, 0];
+const WEEKDAYS_PLURAL = { 1: 'poniedziałki', 2: 'wtorki', 3: 'środy', 4: 'czwartki', 5: 'piątki', 6: 'soboty', 0: 'niedziele' };
+const WEEKDAYS_ABBR = { 1: 'pn', 2: 'wt', 3: 'śr', 4: 'cz', 5: 'pt', 6: 'sb', 0: 'nd' };
+// Presety częstotliwości w formularzu obowiązku — "Własne…" odsłania pola liczba + jednostka.
+const SCHEDULE_PRESETS = [
+  { key: 'daily', label: 'Codziennie', unit: 'day', interval: 1 },
+  { key: 'weekly', label: 'Co tydzień', unit: 'week', interval: 1 },
+  { key: 'biweekly', label: 'Co 2 tygodnie', unit: 'week', interval: 2 },
+  { key: 'monthly', label: 'Co miesiąc', unit: 'month', interval: 1 },
+  { key: 'once', label: 'Raz' },
+  { key: 'custom', label: 'Własne…' },
+];
+const MINUTE_CHOICES = [5, 10, 15, 30, 45, 60];
+// Jak daleko wstecz szukamy niewykonanych wystąpień. Zaległości są grupowane per
+// obowiązek, więc dłuższe okno nie zaśmieca listy — jedynie "od ilu dni" jest dokładniejsze.
+const OVERDUE_LOOKBACK_DAYS = 90;
+const RESET_CONFIRM_WORD = 'USUŃ';
 const MEMBER_COLORS = ['#4C6B57', '#B45309', '#3B7DD8', '#7A5C9E', '#C0703A', '#6B7280'];
 const CATEGORY_COLOR_PALETTE = ['#3B7DD8', '#6B7280', '#C0703A', '#7A5C9E', '#4C6B57', '#A6862F', '#2D9CB0', '#C97A9E'];
+
+/** Polska odmiana liczebników: plural(5, 'zadanie', 'zadania', 'zadań') → "zadań". */
+function plural(n, one, few, many) {
+  if (n === 1) return one;
+  const mod10 = n % 10;
+  const mod100 = n % 100;
+  if (mod10 >= 2 && mod10 <= 4 && !(mod100 >= 12 && mod100 <= 14)) return few;
+  return many;
+}
 
 function escapeHtml(str) {
   return String(str ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -109,13 +136,17 @@ function formatFullDate(date) {
   return `${WEEKDAYS_LONG[(date.getDay() + 6) % 7]}, ${date.getDate()} ${MONTHS_GEN[date.getMonth()]} ${date.getFullYear()}`;
 }
 
-/** Krótki opis harmonogramu do plakietki kategorii, np. "codz.", "co 2 dni", "raz, 20 września". */
+/** Krótki opis harmonogramu do plakietki, np. "codz.", "co 2 dni", "pn, cz", "raz, 20 września". */
 function describeScheduleShort(schedule) {
   if (schedule.mode === 'once') {
     const d = parseDateKey(schedule.anchorDate);
     return `raz, ${d.getDate()} ${MONTHS_GEN[d.getMonth()]}`;
   }
   const n = schedule.interval;
+  if (schedule.unit === 'week' && schedule.weekdays?.length && schedule.mode !== 'rolling') {
+    const days = WEEKDAY_ORDER.filter((d) => schedule.weekdays.includes(d)).map((d) => WEEKDAYS_ABBR[d]).join(', ');
+    return n === 1 ? days : `${days} co ${n} tyg.`;
+  }
   if (n === 1) {
     if (schedule.unit === 'day') return 'codz.';
     if (schedule.unit === 'week') return 'co tydz.';
@@ -125,10 +156,38 @@ function describeScheduleShort(schedule) {
   return `co ${n} ${unitShort}`;
 }
 
-function scheduleHintText(mode) {
-  if (mode === 'once') return 'Jednorazowe zdarzenie — pojawi się tylko raz, we wskazanym dniu.';
-  if (mode === 'rolling') return '„Wykonanie” liczy kolejny termin od ostatniego zaznaczenia — dobre dla rzadkich zadań.';
-  return '„Stały” trzyma się kalendarza niezależnie od tego, kiedy wykonasz zadanie — dobre dla codziennych/częstych.';
+/** "co 2 tygodnie", "co 5 dni", "codziennie", "co miesiąc". */
+function describeInterval(unit, n) {
+  if (n === 1) return { day: 'codziennie', week: 'co tydzień', month: 'co miesiąc' }[unit];
+  const words = {
+    day: ['dzień', 'dni', 'dni'],
+    week: ['tydzień', 'tygodnie', 'tygodni'],
+    month: ['miesiąc', 'miesiące', 'miesięcy'],
+  }[unit];
+  return `co ${n} ${plural(n, ...words)}`;
+}
+
+/** Odstęp "po wykonaniu": "3 miesiące", "2 tygodnie", "1 dzień". */
+function describeSpan(unit, n) {
+  const words = {
+    day: ['dzień', 'dni', 'dni'],
+    week: ['tydzień', 'tygodnie', 'tygodni'],
+    month: ['miesiąc', 'miesiące', 'miesięcy'],
+  }[unit];
+  return `${n} ${plural(n, ...words)}`;
+}
+
+function joinWithAnd(items) {
+  if (items.length <= 1) return items.join('');
+  return `${items.slice(0, -1).join(', ')} i ${items[items.length - 1]}`;
+}
+
+/** "dziś", "jutro", "czwartek, 2 października" — do zdań w tekście. */
+function formatDateInline(date, today) {
+  if (sameDay(date, today)) return 'dziś';
+  if (sameDay(date, addUnits(today, 'day', 1))) return 'jutro';
+  const year = date.getFullYear() !== today.getFullYear() ? ` ${date.getFullYear()}` : '';
+  return `${WEEKDAYS_LONG[(date.getDay() + 6) % 7]}, ${date.getDate()} ${MONTHS_GEN[date.getMonth()]}${year}`;
 }
 
 // ---------- Kategorie: pomocnicze renderery ----------
@@ -147,13 +206,13 @@ function categoryIconChip(category, size = 44) {
   return `<div class="icon-chip ${sizeClass}" style="background:${hexToRgba(category.colorHex, tintAlpha())};color:${fg}">${svgIcon(category.icon, { size: Math.round(size * 0.45), color: fg })}</div>`;
 }
 
-function categoryBadge(category, schedule) {
+function categoryBadge(category, schedule, { withName = true } = {}) {
   const scheduleText = describeScheduleShort(schedule);
   if (!category) {
-    return `<span class="cat-badge-uncategorized">Bez pomieszczenia · ${scheduleText}</span>`;
+    return `<span class="cat-badge-uncategorized">${withName ? 'Bez pomieszczenia · ' : ''}${scheduleText}</span>`;
   }
   const fg = categoryFg(category.colorHex);
-  return `<span class="cat-badge" style="background:${hexToRgba(category.colorHex, tintAlpha())};color:${fg}">${escapeHtml(category.name)} · ${scheduleText}</span>`;
+  return `<span class="cat-badge" style="background:${hexToRgba(category.colorHex, tintAlpha())};color:${fg}">${withName ? `${escapeHtml(category.name)} · ` : ''}${scheduleText}</span>`;
 }
 
 // ---------- Stan UI (nie dane — te zawsze czytane ze storage) ----------
@@ -172,7 +231,11 @@ const ui = {
   loginGoogleNoteVisible: false,
   loginGoogleNoteText: 'Logowanie Google wymaga jeszcze skonfigurowania projektu w Google Cloud Console (Faza 2 — patrz README). Na razie kontynuuj lokalnie — dane zostaną na tym urządzeniu.',
   googleSignInBusy: false, // true w trakcie okna zgody Google (blokuje podwójne kliknięcie)
-  choreFilter: 'all', // 'all' | 'fixed' | 'rolling' (filtr trybu harmonogramu w Obowiązkach)
+  choreFilter: 'all', // 'all' | 'mine' | 'unassigned' | <id domownika> (filtr wykonawcy w Obowiązkach)
+  statsExpanded: false, // rozwinięty panel statystyk/poziomu na Start
+  justResolvedKey: null, // "choreId|YYYY-MM-DD" właśnie odhaczonego wystąpienia — jednorazowa animacja
+  toastUndo: null, // funkcja cofająca ostatnią akcję z toastu
+  resetConfirmOpen: false, // rozwinięte potwierdzenie "Usuń wszystkie dane" w Koncie
   syncStatus: 'idle', // 'idle' | 'syncing' | 'ok' | 'error' (synchronizacja z Google Calendar, Faza 2 krok 2)
   syncMessage: '',
   syncedAt: null,
@@ -268,28 +331,71 @@ function buildOccurrenceEntries(occurrences) {
   });
 }
 
-function renderOccurrenceRow(entry, chores, members) {
+/** Wiersz wystąpienia: kółko po lewej to osobny przycisk (odhacza jednym tapnięciem),
+ * reszta wiersza otwiera szczegóły. `overdueSince` (Date) — gdy wiersz reprezentuje
+ * zgrupowane zaległości obowiązku, od najstarszego niewykonanego terminu. */
+function renderOccurrenceRow(entry, chores, members, { overdueSince = null } = {}) {
   const chore = chores.find((c) => c.id === entry.choreId);
   if (!chore) return '';
   const assigneeId = entry.override?.assigneeId ?? chore.assigneeId;
   const member = members.find((m) => m.id === assigneeId);
   const isDone = entry.status === 'done';
-  const isOverdue = !isDone && entry.date.getTime() < startOfToday().getTime();
+  const isSkipped = entry.status === 'skipped';
+  const isClosed = isDone || isSkipped;
+  const today = startOfToday();
+  const isOverdue = !isClosed && entry.date.getTime() < today.getTime();
+  const justResolved = ui.justResolvedKey === `${chore.id}|${entry.key}`;
+
+  let overdueBadge = '';
+  if (isOverdue) {
+    const since = overdueSince || entry.date;
+    const days = Math.round((today - since) / 86400000);
+    overdueBadge = `<span class="badge-overdue">Zaległe ${days <= 1 ? 'od wczoraj' : `od ${days} dni`}</span>`;
+  }
+
+  const checkLabel = isDone
+    ? `Cofnij wykonanie: ${chore.title}`
+    : isSkipped ? `Przywróć pominięte: ${chore.title}` : `Oznacz jako wykonane: ${chore.title}`;
+  const checkIcon = isDone
+    ? svgIcon('check', { size: 14, color: 'currentColor', strokeWidth: 3 })
+    : isSkipped ? svgIcon('skip', { size: 12, color: 'currentColor', strokeWidth: 2.4 }) : '';
 
   return `
-    <button type="button" class="occ-row ${isDone ? 'is-done' : ''}" data-action="open-occurrence" data-choreid="${chore.id}" data-date="${entry.key}">
-      <span class="occ-check">${isDone ? svgIcon('check', { size: 14, color: 'white', strokeWidth: 3 }) : ''}</span>
-      <span class="spacer">
-        <span class="occ-title">${escapeHtml(chore.title)}</span>
-        <span class="occ-meta">
-          ${isOverdue ? '<span class="badge-overdue">Zaległe</span>' : ''}
-          ${member
-            ? `<span class="row" style="gap:6px"><span class="occ-avatar" style="background:${member.colorHex}">${initials(member.name)}</span>${escapeHtml(member.name)} · ${chore.estimatedMinutes} min</span>`
-            : `<span>Nieprzypisane · ${chore.estimatedMinutes} min</span>`}
+    <div class="occ-row ${isDone ? 'is-done' : ''} ${isSkipped ? 'is-skipped' : ''} ${justResolved ? 'is-just-resolved' : ''}">
+      <button type="button" class="occ-check-btn" data-action="quick-toggle" data-choreid="${chore.id}" data-date="${entry.key}" aria-label="${escapeHtml(checkLabel)}" aria-pressed="${isClosed}">
+        <span class="occ-check">${checkIcon}</span>
+      </button>
+      <button type="button" class="occ-main" data-action="open-occurrence" data-choreid="${chore.id}" data-date="${entry.key}">
+        <span class="spacer">
+          <span class="occ-title">${escapeHtml(chore.title)}</span>
+          <span class="occ-meta">
+            ${overdueBadge}
+            ${isSkipped ? '<span class="badge-skipped">Pominięte</span>' : ''}
+            ${member
+              ? `<span class="row" style="gap:6px"><span class="occ-avatar" style="background:${member.colorHex}">${initials(member.name)}</span>${escapeHtml(member.name)} · ${chore.estimatedMinutes} min</span>`
+              : `<span>Nieprzypisane · ${chore.estimatedMinutes} min</span>`}
+          </span>
         </span>
-      </span>
-      ${!isDone ? `<span class="occ-chevron">${svgIcon('chevron-right', { size: 16 })}</span>` : ''}
-    </button>`;
+        ${!isClosed ? `<span class="occ-chevron">${svgIcon('chevron-right', { size: 16 })}</span>` : ''}
+      </button>
+    </div>`;
+}
+
+/** Zaległe wystąpienia pogrupowane per obowiązek: jeden wpis na obowiązek, z najnowszym
+ * zaległym terminem (to on jest odhaczany) i datą najstarszego niewykonanego. */
+function groupOverdue(entries, today, vacations) {
+  const groups = new Map();
+  for (const e of entries) {
+    if (e.date.getTime() >= today.getTime() || e.status !== 'pending' || isVacationDay(e.date, vacations)) continue;
+    const g = groups.get(e.choreId);
+    if (!g) groups.set(e.choreId, { latest: e, since: e.date, count: 1 });
+    else {
+      g.count++;
+      if (e.date > g.latest.date) g.latest = e;
+      if (e.date < g.since) g.since = e.date;
+    }
+  }
+  return [...groups.values()].sort((a, b) => a.since - b.since);
 }
 
 function progressRing(done, total, size = 44) {
@@ -358,18 +464,21 @@ function renderDashboardView() {
 
   const myMemberId = resolveMyMemberId(members);
   const overrides = store.getOverrides();
-  const stats = computeDashboardStats(chores, overrides, store.getOverride, myMemberId);
+  const vacations = store.getVacations();
+  const stats = computeDashboardStats(chores, overrides, store.getOverride, myMemberId, vacations);
 
   const today = startOfToday();
-  const rangeStart = addUnits(today, 'day', -14);
+  const rangeStart = addUnits(today, 'day', -OVERDUE_LOOKBACK_DAYS);
   const rangeEnd = addUnits(today, 'day', 3);
   const occurrences = generateAllOccurrences(chores, rangeStart, rangeEnd);
   const entries = buildOccurrenceEntries(occurrences);
 
-  const overdue = entries.filter((e) => e.date.getTime() < today.getTime() && e.status !== 'done');
+  const overdueGroups = groupOverdue(entries, today, vacations);
   const todayList = entries.filter((e) => sameDay(e.date, today));
   const upcoming = entries.filter((e) => e.date.getTime() > today.getTime());
-  const todayDoneCount = todayList.filter((e) => e.status === 'done').length;
+  const todayCounted = todayList.filter((e) => e.status !== 'skipped');
+  const todayDoneCount = todayCounted.filter((e) => e.status === 'done').length;
+  const activeVacation = store.getActiveVacation(dateKey(today));
 
   const weekPct = stats.weekTotal > 0 ? Math.round((stats.weekDone / stats.weekTotal) * 100) : 100;
   const hour = new Date().getHours();
@@ -382,6 +491,7 @@ function renderDashboardView() {
   const nextMin = level.next ? level.next.min : null;
   const levelPct = nextMin ? Math.max(4, Math.min(100, Math.round(((stats.points - level.min) / (nextMin - level.min)) * 100))) : 100;
   const levelPointsLabel = nextMin ? `${stats.points} / ${nextMin} pkt` : `${stats.points} pkt · najwyższy poziom!`;
+  const streakDays = `${stats.streak} ${plural(stats.streak, 'dzień', 'dni', 'dni')}`;
 
   let html = `
     <div class="view">
@@ -390,70 +500,85 @@ function renderDashboardView() {
           <h1 class="hero-title">${greeting}!</h1>
           <p class="hero-sub">${formatFullDate(today)}</p>
         </div>
-        <button type="button" class="account-fab" data-action="open-account" aria-label="Konto">${meLabel}</button>
-      </div>
-
-      <div class="level-banner">
-        <div class="level-banner-icon">${svgIcon(level.icon, { size: 24, color: 'currentColor' })}</div>
-        <div class="level-banner-body">
-          <div class="level-banner-top">
-            <div class="level-banner-title">${escapeHtml(level.title)}</div>
-            <div class="level-banner-points">${levelPointsLabel}</div>
-          </div>
-          <div class="level-banner-track"><div class="level-banner-fill" style="width:${levelPct}%"></div></div>
+        <div class="row" style="gap:10px">
+          <button type="button" class="fab-btn" data-action="new-chore" aria-label="Dodaj obowiązek">${svgIcon('plus', { size: 20, strokeWidth: 2.2 })}</button>
+          <button type="button" class="account-fab" data-action="open-account" aria-label="Konto">${meLabel}</button>
         </div>
       </div>
 
-      <div class="section">
-        <div class="section-label">Statystyki</div>
-        <div class="stats-grid">
-          <div class="stat-card stat-card--today">
-            ${progressRing(todayDoneCount, todayList.length)}
-            <div><div class="stat-value">${todayDoneCount}/${todayList.length}</div><div class="stat-label">Dziś wykonane</div></div>
-          </div>
-          <div class="stat-card stat-card--streak">
-            <div class="stat-card-icon stat-icon-streak">${svgIcon('flame', { size: 22, color: 'currentColor' })}</div>
-            <div><div class="stat-value">${stats.streak}</div><div class="stat-label">${stats.streak === 1 ? 'dzień passy' : 'dni passy'}</div></div>
-          </div>
-          <div class="stat-card stat-card--points">
-            <div class="stat-card-icon stat-icon-points">${svgIcon('starburst', { size: 22, color: 'currentColor' })}</div>
-            <div><div class="stat-value">${stats.points}</div><div class="stat-label">Twoje punkty</div></div>
-          </div>
-          <div class="stat-card stat-card--week">
-            <div class="stat-card-icon stat-icon-week">${svgIcon('trending-up', { size: 22, color: 'currentColor' })}</div>
-            <div><div class="stat-value">${weekPct}%</div><div class="stat-label">tydzień na bieżąco</div></div>
-          </div>
-        </div>
-      </div>
+      ${activeVacation ? `
+      <div class="vacation-banner">
+        ${svgIcon('sun', { size: 20, color: 'currentColor' })}
+        <span class="spacer">Tryb urlopowy${activeVacation.until ? ` do ${formatDateInline(parseDateKey(activeVacation.until), today)}` : ''} — zaległości i passa czekają.</span>
+        <button type="button" class="link-btn" data-action="end-vacation">Wyłącz</button>
+      </div>` : ''}
 
-      <div class="section">
-        <div class="section-label">Zaplanuj zadania</div>
-        <div class="quick-actions">
-          <button type="button" class="btn-quick btn-quick-primary" data-action="new-chore">${svgIcon('plus', { size: 18 })}Obowiązek</button>
-          <button type="button" class="btn-quick btn-quick-secondary" data-action="new-once">${svgIcon('flash', { size: 18, color: 'var(--cp-accent)' })}Jednorazowe</button>
+      <div class="stats-summary">
+        <button type="button" class="stats-bar" data-action="toggle-stats" aria-expanded="${ui.statsExpanded}" aria-controls="statsPanel">
+          <span class="stats-bar-item">${progressRing(todayDoneCount, todayCounted.length, 22)}<b>${todayDoneCount}/${todayCounted.length}</b> dziś</span>
+          <span class="stats-bar-item stat-icon-streak-fg">${svgIcon('flame', { size: 16, color: 'currentColor' })}<b>${streakDays}</b></span>
+          <span class="stats-bar-item stat-icon-points-fg">${svgIcon('starburst', { size: 16, color: 'currentColor' })}<b>${stats.points}</b> pkt</span>
+          <span class="stats-bar-chevron">${svgIcon('chevron-down', { size: 16 })}</span>
+        </button>
+        <div id="statsPanel" class="stats-panel" ${ui.statsExpanded ? '' : 'hidden'}>
+          <div class="level-banner">
+            <div class="level-banner-icon">${svgIcon(level.icon, { size: 24, color: 'currentColor' })}</div>
+            <div class="level-banner-body">
+              <div class="level-banner-top">
+                <div class="level-banner-title">${escapeHtml(level.title)}</div>
+                <div class="level-banner-points">${levelPointsLabel}</div>
+              </div>
+              <div class="level-banner-track"><div class="level-banner-fill" style="width:${levelPct}%"></div></div>
+            </div>
+          </div>
+          <div class="stats-grid">
+            <div class="stat-card stat-card--today">
+              ${progressRing(todayDoneCount, todayCounted.length)}
+              <div><div class="stat-value">${todayDoneCount}/${todayCounted.length}</div><div class="stat-label">wykonane dziś</div></div>
+            </div>
+            <div class="stat-card stat-card--streak">
+              <div class="stat-card-icon stat-icon-streak">${svgIcon('flame', { size: 22, color: 'currentColor' })}</div>
+              <div><div class="stat-value">${stats.streak}</div><div class="stat-label">${plural(stats.streak, 'dzień', 'dni', 'dni')} passy domu</div></div>
+            </div>
+            <div class="stat-card stat-card--points">
+              <div class="stat-card-icon stat-icon-points">${svgIcon('starburst', { size: 22, color: 'currentColor' })}</div>
+              <div><div class="stat-value">${stats.points}</div><div class="stat-label">Twoje punkty</div></div>
+            </div>
+            <div class="stat-card stat-card--week">
+              <div class="stat-card-icon stat-icon-week">${svgIcon('trending-up', { size: 22, color: 'currentColor' })}</div>
+              <div><div class="stat-value">${weekPct}%</div><div class="stat-label">wykonane w tym tygodniu</div></div>
+            </div>
+          </div>
         </div>
       </div>
   `;
 
-  if (overdue.length > 0) {
+  if (overdueGroups.length > 0) {
     html += `<div class="section">
-      <div class="row-between"><div class="section-label" style="color:var(--cp-danger)">Zaległe</div><span class="text-secondary text-sm">${overdue.length}</span></div>
-      <div class="stack">${overdue.map((e) => renderOccurrenceRow(e, chores, members)).join('')}</div>
+      <div class="row-between"><h2 class="section-label" style="color:var(--cp-danger)">Zaległe</h2><span class="text-secondary text-sm">${overdueGroups.length}</span></div>
+      <div class="stack">${overdueGroups.map((g) => renderOccurrenceRow(g.latest, chores, members, { overdueSince: g.since })).join('')}</div>
     </div>`;
   }
 
+  let todayEmpty = '';
+  if (todayList.length === 0) {
+    const next = upcoming.find((e) => e.status === 'pending');
+    const nextChore = next && chores.find((c) => c.id === next.choreId);
+    todayEmpty = nextChore
+      ? `<p class="empty-note">Wolne. Następne: ${escapeHtml(nextChore.title.toLowerCase())}, ${formatDateInline(next.date, today)}.</p>`
+      : '<p class="empty-note">Wolne — na dziś nic nie zaplanowano.</p>';
+  } else if (todayList.every((e) => e.status !== 'pending')) {
+    todayEmpty = '<p class="empty-note">Wszystko na dziś zrobione.</p>';
+  }
+
   html += `<div class="section">
-    <div class="row-between"><div class="section-label">Dziś</div><div style="font-size:12.5px;font-weight:700;color:var(--cp-accent)">${todayDoneCount} z ${todayList.length}</div></div>
-    <div class="stack">${
-      todayList.length
-        ? todayList.map((e) => renderOccurrenceRow(e, chores, members)).join('')
-        : '<p class="empty-note">Brak obowiązków zaplanowanych na dziś.</p>'
-    }</div>
+    <div class="row-between"><h2 class="section-label">Dziś</h2><div style="font-size:12.5px;font-weight:700;color:var(--cp-accent)">${todayCounted.length ? `${todayDoneCount} z ${todayCounted.length}` : ''}</div></div>
+    <div class="stack">${todayList.map((e) => renderOccurrenceRow(e, chores, members)).join('')}${todayEmpty}</div>
   </div>`;
 
   if (upcoming.length > 0) {
     html += `<div class="section">
-      <div class="section-label">Najbliższe dni</div>
+      <h2 class="section-label">Najbliższe dni</h2>
       <div class="stack">${upcoming.slice(0, 6).map((e) => renderOccurrenceRow(e, chores, members)).join('')}</div>
     </div>`;
   }
@@ -467,8 +592,11 @@ function renderEmptyChoresState() {
     <div class="empty-state">
       <div class="icon-chip icon-chip--md" style="width:64px;height:64px;border-radius:20px;background:var(--cp-accent-tint);margin:0 auto 16px;color:var(--cp-accent)">${svgIcon('breeze', { size: 28, color: 'currentColor' })}</div>
       <h2>Brak obowiązków</h2>
-      <p class="text-secondary" style="margin-top:8px">Dodaj pierwszy obowiązek, żeby zacząć budować nawyk sprzątania.</p>
-      <button type="button" class="btn btn-primary" style="margin-top:16px" data-action="new-chore">${svgIcon('plus', { size: 18 })}Dodaj obowiązek</button>
+      <p class="text-secondary" style="margin-top:8px">Wybierz kilka gotowych obowiązków dla swoich pomieszczeń albo dodaj własny.</p>
+      <div class="stack" style="margin-top:20px">
+        <button type="button" class="btn btn-primary btn-block" data-action="open-template-picker" data-multi="1">${svgIcon('list', { size: 18 })}Zacznij od gotowego zestawu</button>
+        <button type="button" class="btn btn-outline btn-block" data-action="new-chore-blank">${svgIcon('plus', { size: 18 })}Dodaj własny obowiązek</button>
+      </div>
     </div>
   </div>`;
 }
@@ -519,7 +647,7 @@ function renderMonthView() {
     const date = parseDateKey(ui.selectedDay);
     const dayOccs = buildOccurrenceEntries(byDay.get(ui.selectedDay) || []);
     dayPanel = `<div class="section">
-      <div class="row-between"><div class="section-label">${formatDayHeading(date, today)}, ${date.getDate()} ${MONTHS_GEN[date.getMonth()]}</div><div style="font-size:12.5px;font-weight:700;color:var(--cp-accent)">${dayOccs.length} ${dayOccs.length === 1 ? 'zadanie' : 'zadania'}</div></div>
+      <div class="row-between"><div class="section-label">${formatDayHeading(date, today)}, ${date.getDate()} ${MONTHS_GEN[date.getMonth()]}</div><div style="font-size:12.5px;font-weight:700;color:var(--cp-accent)">${dayOccs.length} ${plural(dayOccs.length, 'zadanie', 'zadania', 'zadań')}</div></div>
       <div class="stack">${
         dayOccs.length
           ? dayOccs.map((e) => renderOccurrenceRow(e, chores, members)).join('')
@@ -555,58 +683,81 @@ function renderMonthView() {
 function renderChoresView() {
   const chores = store.getChores();
   const categories = store.getCategories();
+  const members = store.getMembers();
+  const myMemberId = resolveMyMemberId(members);
 
-  const filtered = chores.filter((c) => ui.choreFilter === 'all' || c.schedule.mode === ui.choreFilter);
-  const grouped = { daily: [], frequent: [], rare: [], once: [] };
-  for (const c of filtered) (grouped[c.frequencyTier] || grouped.frequent).push(c);
+  // Filtr po wykonawcy — pojęcia z życia ("Moje", imię domownika), nie z modelu danych.
+  const filters = [{ key: 'all', label: 'Wszystkie' }];
+  if (myMemberId) filters.push({ key: 'mine', label: 'Moje' });
+  for (const m of members) if (m.id !== myMemberId) filters.push({ key: m.id, label: m.name });
+  filters.push({ key: 'unassigned', label: 'Nieprzypisane' });
+  if (!filters.some((f) => f.key === ui.choreFilter)) ui.choreFilter = 'all';
 
-  let choresHtml = '';
-  for (const tier of ['daily', 'frequent', 'rare', 'once']) {
-    if (grouped[tier].length === 0) continue;
+  const matchesFilter = (c) => {
+    if (ui.choreFilter === 'all') return true;
+    if (ui.choreFilter === 'mine') return c.assigneeId === myMemberId;
+    if (ui.choreFilter === 'unassigned') return !c.assigneeId || !members.some((m) => m.id === c.assigneeId);
+    return c.assigneeId === ui.choreFilter;
+  };
+  const filtered = chores.filter(matchesFilter);
+  const active = filtered.filter((c) => c.active !== false);
+  const paused = filtered.filter((c) => c.active === false);
+
+  // Grupy wg pomieszczeń, w kolejności z listy Pomieszczeń; na końcu obowiązki bez
+  // pomieszczenia (także te wskazujące na usunięte) i wstrzymane.
+  const groups = categories
+    .map((cat) => ({ category: cat, label: cat.name, items: active.filter((c) => c.categoryId === cat.id) }))
+    .filter((g) => g.items.length);
+  const noRoom = active.filter((c) => !categories.some((cat) => cat.id === c.categoryId));
+  if (noRoom.length) groups.push({ category: null, label: 'Bez pomieszczenia', items: noRoom });
+
+  let choresHtml = groups.map((g) => `<div class="section">
+      <h2 class="section-label">${escapeHtml(g.label)}</h2>
+      <div class="stack">${g.items.map((chore) => renderChoreCard(chore, members)).join('')}</div>
+    </div>`).join('');
+  if (paused.length) {
     choresHtml += `<div class="section">
-      <div class="section-label">${FREQUENCY_LABEL[tier]}</div>
-      <div class="stack">${grouped[tier].map((chore) => renderChoreCard(chore, categories)).join('')}</div>
+      <h2 class="section-label">Wstrzymane</h2>
+      <div class="stack">${paused.map((chore) => renderChoreCard(chore, members)).join('')}</div>
     </div>`;
   }
-  if (filtered.length === 0) choresHtml = '<p class="empty-note">Brak obowiązków spełniających ten filtr.</p>';
-
-  const members = store.getMembers();
-  const filters = [
-    { key: 'all', label: 'Wszystkie' },
-    { key: 'fixed', label: 'Stałe' },
-    { key: 'rolling', label: 'Od wykonania' },
-  ];
+  if (filtered.length === 0) {
+    choresHtml = chores.length === 0
+      ? '<p class="empty-note">Brak obowiązków — dodaj pierwszy przyciskiem „+”.</p>'
+      : '<p class="empty-note">Nikt nie ma tu przypisanych obowiązków.</p>';
+  }
 
   return `
     <div class="view">
       <div class="view-header-fab">
         <div>
           <h1 style="font-size:24px;font-weight:800;letter-spacing:-0.01em">Obowiązki</h1>
-          <p class="text-sm text-secondary" style="margin-top:4px">${chores.length} ${chores.length === 1 ? 'obowiązek' : 'obowiązków'} · ${members.length} ${members.length === 1 ? 'domownik' : 'domowników'}</p>
+          <p class="text-sm text-secondary" style="margin-top:4px">${chores.length} ${plural(chores.length, 'obowiązek', 'obowiązki', 'obowiązków')} · ${members.length} ${plural(members.length, 'domownik', 'domowników', 'domowników')}</p>
         </div>
         <button type="button" class="fab-btn" data-action="new-chore" aria-label="Dodaj obowiązek">${svgIcon('plus', { size: 20, strokeWidth: 2.2 })}</button>
       </div>
 
-      <div class="filter-pills">
-        ${filters.map((f) => `<button type="button" class="filter-pill ${ui.choreFilter === f.key ? 'is-active' : ''}" data-action="set-chore-filter" data-filter="${f.key}">${f.label}</button>`).join('')}
+      <div class="filter-pills" role="group" aria-label="Pokaż obowiązki">
+        ${filters.map((f) => `<button type="button" class="filter-pill ${ui.choreFilter === f.key ? 'is-active' : ''}" aria-pressed="${ui.choreFilter === f.key}" data-action="set-chore-filter" data-filter="${escapeHtml(f.key)}">${escapeHtml(f.label)}</button>`).join('')}
       </div>
 
       ${choresHtml}
-
-      <button type="button" class="btn btn-outline btn-block" style="color:var(--cp-danger)" data-action="reset-demo">Zresetuj dane demonstracyjne</button>
     </div>
   `;
 }
 
-function renderChoreCard(chore, categories) {
+function renderChoreCard(chore, members) {
   const category = getCategoryOrFallback(chore.categoryId);
+  const member = members.find((m) => m.id === chore.assigneeId);
+  const isPaused = chore.active === false;
   return `
-    <button type="button" class="chore-row ${chore.active ? '' : 'is-inactive'}" data-action="edit-chore" data-choreid="${chore.id}">
+    <button type="button" class="chore-row ${isPaused ? 'is-inactive' : ''}" data-action="edit-chore" data-choreid="${chore.id}">
       ${categoryIconChip(category, 44)}
       <span class="spacer">
         <span class="chore-title">${escapeHtml(chore.title)}</span>
         <span class="chore-meta">
-          ${categoryBadge(category, chore.schedule)}
+          ${isPaused ? '<span class="badge-paused">Wstrzymany</span>' : categoryBadge(category, chore.schedule, { withName: false })}
+          ${member ? `<span class="row" style="gap:5px"><span class="occ-avatar" style="background:${member.colorHex}">${initials(member.name)}</span>${escapeHtml(member.name)}</span>` : ''}
           <span>${chore.estimatedMinutes} min</span>
         </span>
       </span>
@@ -785,11 +936,7 @@ function renderTemplatesView() {
 
           <div class="field">
             <label>Szac. czas</label>
-            <div class="stepper">
-              <button type="button" data-action="adjust-template-minutes" data-delta="-5">–</button>
-              <span>${draft.estimatedMinutes} min</span>
-              <button type="button" data-action="adjust-template-minutes" data-delta="5">+</button>
-            </div>
+            ${minuteChips(draft.estimatedMinutes, 'set-template-minutes')}
           </div>
 
           <div class="field">
@@ -803,6 +950,18 @@ function renderTemplatesView() {
       </div>
     </div>
   `;
+}
+
+/** Chipy szacowanego czasu (5 · 10 · 15 · 30 · 45 · 60+ min). Wartość spoza listy
+ * (np. 20 min z szablonu) dostaje własny, zaznaczony chip, żeby nie zginęła po cichu. */
+function minuteChips(value, action) {
+  const choices = MINUTE_CHOICES.includes(value) || !value ? MINUTE_CHOICES : [...MINUTE_CHOICES, value].sort((a, b) => a - b);
+  return `<div class="chip-group" role="group" aria-label="Szacowany czas">
+    ${choices.map((m) => {
+      const label = m === 60 ? '60+ min' : `${m} min`;
+      return `<button type="button" class="chip ${m === value ? 'is-selected is-accent' : ''}" aria-pressed="${m === value}" data-action="${action}" data-minutes="${m}">${label}</button>`;
+    }).join('')}
+  </div>`;
 }
 
 function templateRow(t, category) {
@@ -932,6 +1091,55 @@ function renderCalendarSyncSection(isGoogle) {
     </div>`;
 }
 
+function renderVacationSection() {
+  const today = startOfToday();
+  const active = store.getActiveVacation(dateKey(today));
+  if (active) {
+    return `
+      <div class="status-row">
+        ${categoryIconChip({ colorHex: '#A6862F', icon: 'sun' }, 40)}
+        <div class="spacer">
+          <div style="font-size:14.5px;font-weight:700">Włączony${active.until ? ` do ${formatDateInline(parseDateKey(active.until), today)}` : ' do odwołania'}</div>
+          <div class="text-sm text-secondary" style="margin-top:2px">Zaległości z tych dni nie przerwą passy domu.</div>
+        </div>
+        <button type="button" class="btn btn-outline" style="height:44px;padding:0 14px" data-action="end-vacation">Wyłącz</button>
+      </div>`;
+  }
+  return `
+    <div class="stack" style="gap:12px">
+      <p class="hint" style="margin:0">Na czas wyjazdu: obowiązki z tych dni nie staną się zaległe i nie przerwą passy. Działa dla całego domu.</p>
+      <div class="field">
+        <label for="vacationUntil">Do kiedy</label>
+        <input class="input" id="vacationUntil" type="date" min="${dateKey(today)}" value="${dateKey(addUnits(today, 'day', 7))}" />
+      </div>
+      <button type="button" class="btn btn-outline btn-block" data-action="start-vacation">${svgIcon('sun', { size: 18 })}Włącz tryb urlopowy</button>
+    </div>`;
+}
+
+/** Reset danych — celowo schowany tutaj (a nie na liście obowiązków) i zabezpieczony
+ * wpisaniem słowa. W trybie Google dane są wspólne z domownikami przez kalendarz, więc
+ * reset jest wyłączony: wypchnąłby dane przykładowe wszystkim. */
+function renderDataSection(isGoogle) {
+  if (isGoogle) {
+    return '<p class="hint" style="margin:0">Dane są współdzielone z domownikami przez Kalendarz Google, dlatego usuwanie wszystkiego naraz jest tu wyłączone.</p>';
+  }
+  if (!ui.resetConfirmOpen) {
+    return `<button type="button" class="btn btn-danger-ghost btn-block" data-action="open-reset-confirm">${svgIcon('trash-2', { size: 17 })}Usuń wszystkie dane i wczytaj przykładowe</button>`;
+  }
+  return `
+    <div class="danger-box stack" style="gap:12px">
+      <p class="text-sm" style="line-height:1.5">Zostaną usunięte obowiązki, historia wykonań, pomieszczenia i domownicy z tego urządzenia, a w ich miejsce pojawią się dane przykładowe. Szablony zostaną. Tego nie da się cofnąć.</p>
+      <div class="field">
+        <label for="resetConfirmInput">Wpisz ${RESET_CONFIRM_WORD}, żeby potwierdzić</label>
+        <input class="input" id="resetConfirmInput" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" />
+      </div>
+      <div class="row" style="gap:8px">
+        <button type="button" class="btn btn-outline" style="flex:1" data-action="cancel-reset">Anuluj</button>
+        <button type="button" class="btn btn-danger" style="flex:1" id="resetConfirmBtn" data-action="confirm-reset" disabled>Usuń dane</button>
+      </div>
+    </div>`;
+}
+
 function renderAccountView() {
   const session = store.getSession();
   const members = store.getMembers();
@@ -1013,6 +1221,16 @@ function renderAccountView() {
         ${svgIcon('chevron-right', { size: 15, color: 'var(--cp-chevron)' })}
       </button>
 
+      <div class="section">
+        <h2 class="section-label">Tryb urlopowy</h2>
+        ${renderVacationSection()}
+      </div>
+
+      <div class="section">
+        <h2 class="section-label">Dane</h2>
+        ${renderDataSection(isGoogle)}
+      </div>
+
       <button type="button" class="btn btn-danger-ghost btn-block" data-action="logout" style="margin-top:4px">
         ${svgIcon('logout', { size: 17 })}Wyloguj się
       </button>
@@ -1034,9 +1252,11 @@ function renderOccurrenceModalContent(choreId, dateKeyStr) {
   const assigneeId = override?.assigneeId ?? chore.assigneeId;
   const date = parseDateKey(dateKeyStr);
   const isDone = status === 'done';
-  const isOverdue = !isDone && date.getTime() < startOfToday().getTime();
+  const isSkipped = status === 'skipped';
+  const isOverdue = status === 'pending' && date.getTime() < startOfToday().getTime();
   const isToday = sameDay(date, startOfToday());
   const member = members.find((m) => m.id === assigneeId);
+  const earlierMissed = isOverdue || isToday ? earlierPendingOverdue(chore, dateKeyStr).length : 0;
 
   return `
     <div class="modal-handle"></div>
@@ -1047,6 +1267,7 @@ function renderOccurrenceModalContent(choreId, dateKeyStr) {
           ${isOverdue ? '<span class="badge-overdue">Zaległe</span>' : ''}
           ${isToday ? '<span class="badge-today">Dziś</span>' : ''}
           ${isDone ? '<span class="badge-done">Wykonane</span>' : ''}
+          ${isSkipped ? '<span class="badge-skipped">Pominięte</span>' : ''}
         </div>
         <h1 class="modal-title">${escapeHtml(chore.title)}</h1>
       </div>
@@ -1082,28 +1303,46 @@ function renderOccurrenceModalContent(choreId, dateKeyStr) {
       </div>
     </div>
 
-    <button type="button" class="btn btn-primary btn-block" data-action="toggle-occurrence" data-choreid="${choreId}" data-date="${dateKeyStr}">
-      ${svgIcon(isDone ? 'close' : 'check', { size: 19, strokeWidth: 2.2 })}
-      ${isDone ? 'Cofnij wykonanie' : 'Oznacz jako wykonane'}
-    </button>
-    <button type="button" class="link-btn" style="justify-content:center" data-action="edit-chore" data-choreid="${choreId}">Edytuj obowiązek</button>
+    ${earlierMissed ? `<p class="hint" style="margin:0">${earlierMissed === 1
+      ? 'Wcześniejszy niewykonany termin tego obowiązku zostanie przy tym oznaczony jako pominięty.'
+      : `Wcześniejsze niewykonane terminy tego obowiązku (${earlierMissed}) zostaną przy tym oznaczone jako pominięte.`}</p>` : ''}
+
+    ${status === 'pending' ? `
+    <div class="stack" style="gap:10px">
+      <button type="button" class="btn btn-primary btn-block" data-action="set-occurrence" data-status="done" data-choreid="${choreId}" data-date="${dateKeyStr}">
+        ${svgIcon('check', { size: 19, strokeWidth: 2.2 })}Oznacz jako wykonane
+      </button>
+      <button type="button" class="btn btn-outline btn-block" data-action="set-occurrence" data-status="skipped" data-choreid="${choreId}" data-date="${dateKeyStr}">
+        ${svgIcon('skip', { size: 16, strokeWidth: 2 })}Pomiń ten termin
+      </button>
+      <p class="hint" style="margin:0;text-align:center">Pominięte nie daje punktów, ale nie przerywa passy.</p>
+    </div>` : `
+    <button type="button" class="btn btn-outline btn-block" data-action="set-occurrence" data-status="pending" data-choreid="${choreId}" data-date="${dateKeyStr}">
+      ${svgIcon('close', { size: 18, strokeWidth: 2.2 })}${isDone ? 'Cofnij wykonanie' : 'Przywróć do zrobienia'}
+    </button>`}
+    <button type="button" class="link-btn" style="justify-content:center;min-height:44px" data-action="edit-chore" data-choreid="${choreId}">Edytuj obowiązek</button>
   `;
 }
 
 // ---------- Modal: formularz obowiązku ----------
+// Widoczne od razu tylko to, czego potrzebuje większość obowiązków domowych: nazwa,
+// pomieszczenie, jak często i kto. Reszta (data startu, godzina, notatka, checklista,
+// szacowany czas) siedzi w zwijanej sekcji "Więcej szczegółów".
 
 function renderChoreFormContent(choreId, presetMode) {
   const chore = choreId ? store.getChore(choreId) : null;
   const members = store.getMembers();
   const categories = store.getCategories();
   const draft = ui.modal.draft;
-  const showIntervalFields = draft.scheduleMode !== 'once';
+  const isOnce = draft.preset === 'once';
+  const showWeekdays = !isOnce && !draft.rolling && draft.unit === 'week';
 
-  const modeButtons = [
-    { key: 'fixed', label: 'Stały' },
-    { key: 'rolling', label: 'Wykonanie' },
-    { key: 'once', label: 'Raz' },
-  ];
+  const detailsSummary = [
+    `${draft.estimatedMinutes} min`,
+    draft.time ? `godz. ${draft.time}` : '',
+    draft.notes.trim() ? 'notatka' : '',
+    draft.checklist.filter((i) => i.trim()).length ? `${draft.checklist.filter((i) => i.trim()).length} ${plural(draft.checklist.filter((i) => i.trim()).length, 'punkt', 'punkty', 'punktów')}` : '',
+  ].filter(Boolean).join(' · ');
 
   return `
     <div class="modal-header" style="align-items:center">
@@ -1122,79 +1361,114 @@ function renderChoreFormContent(choreId, presetMode) {
         <div class="chip-group">
           ${categories.map((cat) => {
             const selected = draft.categoryId === cat.id;
-            return `<button type="button" class="chip ${selected ? 'is-selected' : ''}" style="${selected ? `background:${cat.colorHex}` : ''}" data-action="select-category" data-catid="${cat.id}">${svgIcon(cat.icon, { size: 14, color: selected ? 'currentColor' : categoryFg(cat.colorHex) })}${escapeHtml(cat.name)}</button>`;
+            return `<button type="button" class="chip ${selected ? 'is-selected' : ''}" style="${selected ? `background:${cat.colorHex}` : ''}" aria-pressed="${selected}" data-action="select-category" data-catid="${cat.id}">${svgIcon(cat.icon, { size: 14, color: selected ? 'currentColor' : categoryFg(cat.colorHex) })}${escapeHtml(cat.name)}</button>`;
           }).join('')}
           <button type="button" class="chip is-dashed" data-action="new-category-link">${svgIcon('plus', { size: 14, color: 'var(--cp-text-secondary)', strokeWidth: 2 })}Nowe</button>
         </div>
       </div>
 
       <div class="field">
-        <label>Harmonogram</label>
-        <div class="segmented-3">
-          ${modeButtons.map((m) => `<button type="button" class="${draft.scheduleMode === m.key ? 'is-active' : ''}" data-action="set-schedule-mode" data-mode="${m.key}">${m.label}</button>`).join('')}
+        <label>Jak często</label>
+        <div class="chip-group" role="group" aria-label="Jak często">
+          ${SCHEDULE_PRESETS.map((p) => `<button type="button" class="chip ${draft.preset === p.key ? 'is-selected is-accent' : ''}" aria-pressed="${draft.preset === p.key}" data-action="set-preset" data-preset="${p.key}">${p.label}</button>`).join('')}
         </div>
-        <p class="hint">${scheduleHintText(draft.scheduleMode)}</p>
-      </div>
 
-      ${showIntervalFields ? `
-      <div class="field-row">
-        <div class="field">
-          <label for="f-interval">Co ile</label>
-          <input class="input" id="f-interval" name="interval" type="number" min="1" value="${draft.interval}" style="text-align:center" />
-        </div>
-        <div class="field">
-          <label for="f-unit">Jednostka</label>
-          <select class="select" id="f-unit">
-            <option value="day" ${draft.unit === 'day' ? 'selected' : ''}>dni</option>
-            <option value="week" ${draft.unit === 'week' ? 'selected' : ''}>tygodni</option>
-            <option value="month" ${draft.unit === 'month' ? 'selected' : ''}>miesięcy</option>
+        ${draft.preset === 'custom' ? `
+        <div class="field-row field-row--inline" style="margin-top:4px">
+          <span class="field-inline-label">co</span>
+          <input class="input" id="f-interval" name="interval" type="number" min="1" inputmode="numeric" value="${draft.interval}" style="text-align:center;max-width:88px" aria-label="Co ile" />
+          <select class="select" id="f-unit" aria-label="Jednostka">
+            <option value="day" ${draft.unit === 'day' ? 'selected' : ''}>${plural(draft.interval, 'dzień', 'dni', 'dni')}</option>
+            <option value="week" ${draft.unit === 'week' ? 'selected' : ''}>${plural(draft.interval, 'tydzień', 'tygodnie', 'tygodni')}</option>
+            <option value="month" ${draft.unit === 'month' ? 'selected' : ''}>${plural(draft.interval, 'miesiąc', 'miesiące', 'miesięcy')}</option>
           </select>
-        </div>
-      </div>` : ''}
+        </div>` : ''}
 
-      <div class="field-row">
-        <div class="field">
-          <label for="f-anchor">${draft.scheduleMode === 'once' ? 'Data' : 'Data początkowa'}</label>
+        ${showWeekdays ? `
+        <div class="weekday-row" role="group" aria-label="W które dni tygodnia">
+          ${WEEKDAY_ORDER.map((d, i) => {
+            const on = draft.weekdays.includes(d);
+            return `<button type="button" class="weekday-btn ${on ? 'is-selected' : ''}" aria-pressed="${on}" aria-label="${WEEKDAYS_LONG[i]}" data-action="toggle-weekday" data-day="${d}">${WEEKDAYS_SHORT[i]}</button>`;
+          }).join('')}
+        </div>` : ''}
+
+        ${isOnce ? `
+        <div class="field" style="margin-top:4px">
+          <label for="f-anchor">Kiedy</label>
           <input class="input" id="f-anchor" name="anchorDate" type="date" value="${draft.anchorDate}" />
-        </div>
-        <div class="field">
-          <label for="f-time">Godzina (opcjonalnie)</label>
-          <input class="input" id="f-time" name="time" type="time" value="${draft.time || ''}" />
-        </div>
+        </div>` : `
+        <button type="button" class="switch-row" role="switch" aria-checked="${draft.rolling}" data-action="toggle-rolling">
+          <span class="spacer">
+            <span class="switch-row-title">Licz od ostatniego wykonania</span>
+            <span class="switch-row-hint">Np. okna: 3 miesiące po tym, jak ostatnio umyte — a nie w stałe dni.</span>
+          </span>
+          <span class="switch" aria-hidden="true"></span>
+        </button>`}
+
+        <p class="schedule-preview" id="schedulePreview" aria-live="polite">${escapeHtml(schedulePreviewText(draft, chore))}</p>
       </div>
 
       <div class="field">
-        <label for="f-notes">Notatka</label>
-        <textarea class="textarea" id="f-notes" name="notes" placeholder="Dodatkowe informacje, wskazówki...">${escapeHtml(draft.notes)}</textarea>
-      </div>
-
-      <div class="field">
-        <label>Lista punktów (opcjonalnie)</label>
-        <div class="checklist-editor" id="checklistEditor">
-          ${draft.checklist.map((item, i) => renderChecklistItem(item, i)).join('')}
-        </div>
-        <button type="button" class="link-btn" style="margin-top:8px" data-action="add-checklist-item">${svgIcon('plus', { size: 16, strokeWidth: 2.2 })}Dodaj punkt checklisty</button>
-      </div>
-
-      <div class="field">
-        <label>Szac. czas</label>
-        <div class="stepper">
-          <button type="button" data-action="adjust-minutes" data-delta="-5">–</button>
-          <span>${draft.estimatedMinutes} min</span>
-          <button type="button" data-action="adjust-minutes" data-delta="5">+</button>
-        </div>
-      </div>
-
-      <div class="field">
-        <label>Wykonawca</label>
+        <label>Kto</label>
         <div class="chip-group">
           ${members.map((m) => {
             const selected = draft.assigneeId === m.id;
-            return `<button type="button" class="assignee-chip ${selected ? 'is-selected' : ''}" data-action="select-assignee-chip" data-id="${m.id}"><span class="occ-avatar" style="background:${m.colorHex}">${initials(m.name)}</span>${escapeHtml(m.name)}</button>`;
+            return `<button type="button" class="assignee-chip ${selected ? 'is-selected' : ''}" aria-pressed="${selected}" data-action="select-assignee-chip" data-id="${m.id}"><span class="occ-avatar" style="background:${m.colorHex}">${initials(m.name)}</span>${escapeHtml(m.name)}</button>`;
           }).join('')}
-          <button type="button" class="assignee-chip is-unassigned ${!draft.assigneeId ? 'is-selected' : ''}" data-action="select-assignee-chip" data-id="">Nieprzypisane</button>
+          <button type="button" class="assignee-chip is-unassigned ${!draft.assigneeId ? 'is-selected' : ''}" aria-pressed="${!draft.assigneeId}" data-action="select-assignee-chip" data-id="">Nieprzypisane</button>
         </div>
       </div>
+
+      <div class="details-block">
+        <button type="button" class="details-toggle" data-action="toggle-more" aria-expanded="${draft.showMore}" aria-controls="choreMore">
+          <span class="spacer">
+            <span class="details-toggle-title">Więcej szczegółów</span>
+            <span class="details-toggle-summary">${escapeHtml(detailsSummary)}</span>
+          </span>
+          <span class="details-chevron">${svgIcon('chevron-down', { size: 18 })}</span>
+        </button>
+
+        <div id="choreMore" class="stack" style="gap:24px" ${draft.showMore ? '' : 'hidden'}>
+          <div class="field">
+            <label>Szacowany czas</label>
+            ${minuteChips(draft.estimatedMinutes, 'set-minutes')}
+          </div>
+
+          <div class="field-row">
+            ${isOnce ? '' : `
+            <div class="field">
+              <label for="f-anchor">Zaczyna się od</label>
+              <input class="input" id="f-anchor" name="anchorDate" type="date" value="${draft.anchorDate}" />
+            </div>`}
+            <div class="field">
+              <label for="f-time">Godzina</label>
+              <input class="input" id="f-time" name="time" type="time" value="${draft.time || ''}" />
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="f-notes">Notatka</label>
+            <textarea class="textarea" id="f-notes" name="notes" placeholder="Dodatkowe informacje, wskazówki...">${escapeHtml(draft.notes)}</textarea>
+          </div>
+
+          <div class="field">
+            <label>Lista punktów</label>
+            <div class="checklist-editor" id="checklistEditor">
+              ${draft.checklist.map((item, i) => renderChecklistItem(item, i)).join('')}
+            </div>
+            <button type="button" class="link-btn" style="margin-top:8px;min-height:44px" data-action="add-checklist-item">${svgIcon('plus', { size: 16, strokeWidth: 2.2 })}Dodaj punkt</button>
+          </div>
+        </div>
+      </div>
+
+      ${chore ? `
+      <button type="button" class="switch-row" role="switch" aria-checked="${!draft.active}" data-action="toggle-active">
+        <span class="spacer">
+          <span class="switch-row-title">Wstrzymaj</span>
+          <span class="switch-row-hint">Obowiązek zniknie z planu, dopóki go nie wznowisz — np. podlewanie kwiatów zimą.</span>
+        </span>
+        <span class="switch" aria-hidden="true"></span>
+      </button>` : ''}
 
       <div class="stack" style="gap:12px">
         <button type="submit" class="btn btn-primary btn-block">Zapisz obowiązek</button>
@@ -1206,9 +1480,20 @@ function renderChoreFormContent(choreId, presetMode) {
 
 function renderChecklistItem(value, index) {
   return `<div class="checklist-editor-item" data-index="${index}">
-    <input class="input" value="${escapeHtml(value)}" data-role="checklist-value" />
+    <input class="input" value="${escapeHtml(value)}" data-role="checklist-value" aria-label="Punkt ${index + 1}" />
     <button type="button" class="icon-btn icon-btn--sm" style="border:none;background:none" data-action="remove-checklist-item" data-index="${index}" aria-label="Usuń punkt">${svgIcon('close', { size: 15, color: 'var(--cp-text-tertiary)' })}</button>
   </div>`;
+}
+
+/** Który preset częstotliwości odpowiada zapisanemu harmonogramowi. */
+function presetForSchedule(schedule) {
+  if (schedule.mode === 'once') return 'once';
+  const { unit, interval } = schedule;
+  if (unit === 'day' && interval === 1) return 'daily';
+  if (unit === 'week' && interval === 1) return 'weekly';
+  if (unit === 'week' && interval === 2) return 'biweekly';
+  if (unit === 'month' && interval === 1) return 'monthly';
+  return 'custom';
 }
 
 function makeChoreDraft(chore, presetMode) {
@@ -1218,20 +1503,79 @@ function makeChoreDraft(chore, presetMode) {
   return {
     title: chore?.title || '',
     notes: chore?.notes || '',
-    scheduleMode: schedule.mode,
-    unit: schedule.unit,
-    interval: schedule.interval,
+    preset: presetForSchedule(schedule),
+    rolling: schedule.mode === 'rolling',
+    unit: schedule.unit || 'day',
+    interval: schedule.interval || 1,
+    weekdays: schedule.weekdays ? [...schedule.weekdays] : [],
     anchorDate: schedule.anchorDate,
     time: schedule.time || '',
     categoryId: chore?.categoryId ?? null,
     assigneeId: chore?.assigneeId ?? null,
     estimatedMinutes: chore?.estimatedMinutes ?? 15,
     checklist: chore?.checklist ? [...chore.checklist] : [],
+    active: chore ? chore.active !== false : true,
+    showMore: false,
   };
 }
 
+/** Harmonogram zapisywany na obowiązku, zbudowany z draftu formularza. */
+function scheduleFromDraft(draft) {
+  if (draft.preset === 'once') {
+    return { mode: 'once', unit: 'day', interval: 1, weekdays: null, anchorDate: draft.anchorDate || dateKey(startOfToday()), time: draft.time || null };
+  }
+  const useWeekdays = !draft.rolling && draft.unit === 'week' && draft.weekdays.length > 0;
+  return {
+    mode: draft.rolling ? 'rolling' : 'fixed',
+    unit: draft.unit,
+    interval: Math.max(1, Number(draft.interval) || 1),
+    weekdays: useWeekdays ? WEEKDAY_ORDER.filter((d) => draft.weekdays.includes(d)) : null,
+    anchorDate: draft.anchorDate || dateKey(startOfToday()),
+    time: draft.time || null,
+  };
+}
+
+/** Zdanie pod harmonogramem, które pokazuje, co wybrane ustawienia znaczą w praktyce:
+ * "Następnym razem: czwartek, 2 października. Potem co 2 tygodnie." */
+function schedulePreviewText(draft, chore) {
+  const today = startOfToday();
+  const schedule = scheduleFromDraft(draft);
+  if (!draft.anchorDate) return '';
+
+  if (schedule.mode === 'once') {
+    return `Jednorazowo: ${formatDateInline(parseDateKey(schedule.anchorDate), today)}.`;
+  }
+
+  if (schedule.mode === 'rolling') {
+    const lastCompletedAt = chore?.schedule?.mode === 'rolling' ? chore.lastCompletedAt : null;
+    const due = nextOccurrenceDate({ schedule, lastCompletedAt }, today);
+    const when = due < today ? `${formatDateInline(due, today)} (już zaległe)` : formatDateInline(due, today);
+    return `Najbliżej: ${when}. Kolejne terminy ${describeSpan(schedule.unit, schedule.interval)} po każdym wykonaniu.`;
+  }
+
+  const next = nextOccurrenceDate({ schedule }, today);
+  if (!next) return '';
+  let rhythm;
+  if (schedule.weekdays) {
+    const days = joinWithAnd(schedule.weekdays.map((d) => WEEKDAYS_PLURAL[d]));
+    rhythm = schedule.interval === 1 ? `w ${days}` : `co ${schedule.interval} ${plural(schedule.interval, 'tydzień', 'tygodnie', 'tygodni')}, w ${days}`;
+  } else {
+    rhythm = describeInterval(schedule.unit, schedule.interval);
+  }
+  return `Następnym razem: ${formatDateInline(next, today)}. Potem ${rhythm}.`;
+}
+
+/** Odświeża samo zdanie-podgląd (bez re-renderu formularza — żeby nie zgubić fokusu
+ * w trakcie wpisywania liczby czy wybierania daty). */
+function updateSchedulePreview() {
+  const el = document.getElementById('schedulePreview');
+  if (!el || ui.modal?.type !== 'chore') return;
+  const chore = ui.modal.choreId ? store.getChore(ui.modal.choreId) : null;
+  el.textContent = schedulePreviewText(ui.modal.draft, chore);
+}
+
 /** Zgrywa bieżące wartości pól tekstowych formularza obowiązku do ui.modal.draft
- * PRZED każdym częściowym re-renderem (klik chipa/segmentu/steppera) — inaczej
+ * PRZED każdym częściowym re-renderem (klik chipa/przełącznika) — inaczej
  * właśnie wpisywany tekst przepadłby przy regeneracji HTML z draftu. */
 function captureChoreFormInputs() {
   if (!ui.modal || ui.modal.type !== 'chore') return;
@@ -1245,22 +1589,143 @@ function captureChoreFormInputs() {
   const editor = document.getElementById('checklistEditor');
   if (title) d.title = title.value;
   if (notes) d.notes = notes.value;
-  if (interval) d.interval = Number(interval.value) || d.interval;
+  if (interval) d.interval = Math.max(1, Number(interval.value) || d.interval);
   if (unit) d.unit = unit.value;
   if (anchor) d.anchorDate = anchor.value;
   if (time) d.time = time.value;
   if (editor) d.checklist = [...editor.querySelectorAll('[data-role="checklist-value"]')].map((i) => i.value);
 }
 
+// ---------- Modal: wybór sposobu dodania + biblioteka szablonów ----------
+
+function renderAddChoiceContent() {
+  const options = [
+    { action: 'open-template-picker', icon: 'list', title: 'Z szablonu', sub: 'Gotowe obowiązki dla pomieszczeń — najszybciej' },
+    { action: 'new-chore-blank', icon: 'plus', title: 'Od zera', sub: 'Własna nazwa i harmonogram' },
+    { action: 'new-once', icon: 'flash', title: 'Jednorazowe zdarzenie', sub: 'Jeden termin, bez powtórzeń' },
+  ];
+  return `
+    <div class="modal-handle"></div>
+    <div class="modal-header" style="align-items:center">
+      <h2 class="modal-title-sm">Dodaj obowiązek</h2>
+      <button type="button" class="icon-btn icon-btn--sm" data-action="close-modal" aria-label="Zamknij">${svgIcon('close', { size: 16 })}</button>
+    </div>
+    <div class="stack">
+      ${options.map((o) => `
+      <button type="button" class="choice-row" data-action="${o.action}">
+        <span class="icon-chip icon-chip--md" style="background:var(--cp-accent-tint);color:var(--cp-accent)">${svgIcon(o.icon, { size: 20, color: 'currentColor' })}</span>
+        <span class="spacer">
+          <span class="choice-row-title">${o.title}</span>
+          <span class="choice-row-sub">${o.sub}</span>
+        </span>
+        ${svgIcon('chevron-right', { size: 16, color: 'var(--cp-chevron)' })}
+      </button>`).join('')}
+    </div>`;
+}
+
+function normalizeForSearch(str) {
+  return String(str || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/ł/g, 'l');
+}
+
+/** Biblioteka szablonów w głównym przepływie dodawania. Tryb pojedynczy: tapnięcie
+ * otwiera formularz wypełniony szablonem (do dostosowania przed zapisem). Tryb
+ * wielokrotny: zaznaczasz kilka i dodajesz je naraz, z domyślnymi ustawieniami. */
+function renderTemplatePickerContent() {
+  const { multi, selected } = ui.modal;
+  const templates = store.getTemplates();
+  const categories = store.getCategories();
+  const groups = categories
+    .map((cat) => ({ category: cat, label: cat.name, items: templates.filter((t) => t.categoryId === cat.id) }))
+    .filter((g) => g.items.length);
+  const orphaned = templates.filter((t) => !categories.some((c) => c.id === t.categoryId));
+  if (orphaned.length) groups.push({ category: null, label: 'Bez pomieszczenia', items: orphaned });
+
+  const rowsHtml = groups.map((g) => `
+    <div class="picker-group" data-group>
+      <h3 class="section-label">${escapeHtml(g.label)}</h3>
+      <div class="stack">
+        ${g.items.map((t) => {
+          const on = selected.includes(t.id);
+          return `<button type="button" class="picker-row ${on ? 'is-selected' : ''}" data-search="${escapeHtml(normalizeForSearch(`${t.title} ${g.label}`))}"
+              data-action="${multi ? 'toggle-template-pick' : 'apply-template'}" data-tplid="${t.id}" ${multi ? `aria-pressed="${on}"` : ''}>
+            ${multi ? `<span class="picker-check">${on ? svgIcon('check', { size: 13, color: 'currentColor', strokeWidth: 3 }) : ''}</span>` : categoryIconChip(g.category, 40)}
+            <span class="spacer">
+              <span class="chore-title">${escapeHtml(t.title)}</span>
+              <span class="chore-meta"><span>${describeScheduleShort(t.schedule)}${t.schedule.mode === 'rolling' ? ' od wykonania' : ''} · ${t.estimatedMinutes} min</span></span>
+            </span>
+            ${multi ? '' : svgIcon('chevron-right', { size: 16, color: 'var(--cp-chevron)' })}
+          </button>`;
+        }).join('')}
+      </div>
+    </div>`).join('');
+
+  return `
+    <div class="modal-header" style="align-items:center">
+      <button type="button" class="icon-btn icon-btn--sm" data-action="close-modal" aria-label="Zamknij">${svgIcon('close', { size: 16 })}</button>
+      <h2 class="modal-title-sm" style="text-align:center;flex:1">${multi ? 'Wybierz obowiązki' : 'Z szablonu'}</h2>
+      <button type="button" class="modal-save-link" data-action="toggle-picker-mode">${multi ? 'Pojedynczo' : 'Zaznacz kilka'}</button>
+    </div>
+    <div class="search-field">
+      ${svgIcon('search', { size: 18, color: 'var(--cp-text-tertiary)' })}
+      <input class="input" id="tplSearch" type="search" placeholder="Szukaj, np. okna" value="${escapeHtml(ui.modal.query)}" aria-label="Szukaj szablonu" autocomplete="off" />
+    </div>
+    ${templates.length ? rowsHtml : '<p class="empty-note">Biblioteka szablonów jest pusta — dodaj szablony w Konto → Szablony obowiązków.</p>'}
+    <p class="empty-note" id="tplNoResults" hidden>Nic nie pasuje. Spróbuj innego słowa albo dodaj obowiązek od zera.</p>
+    ${multi ? `
+    <div class="sheet-footer">
+      <button type="button" class="btn btn-primary btn-block" data-action="add-picked-templates" ${selected.length ? '' : 'disabled'}>
+        ${selected.length ? `Dodaj ${selected.length} ${plural(selected.length, 'obowiązek', 'obowiązki', 'obowiązków')}` : 'Zaznacz obowiązki do dodania'}
+      </button>
+    </div>` : `
+    <button type="button" class="link-btn" style="justify-content:center;min-height:44px" data-action="manage-templates">Zarządzaj szablonami</button>`}
+  `;
+}
+
+/** Filtruje wiersze biblioteki szablonów w miejscu (bez re-renderu — fokus zostaje w polu). */
+function applyTemplateSearch() {
+  const q = normalizeForSearch(ui.modal?.query || '').trim();
+  let visible = 0;
+  document.querySelectorAll('#modalRoot .picker-group').forEach((group) => {
+    let groupVisible = 0;
+    group.querySelectorAll('.picker-row').forEach((row) => {
+      const match = !q || row.dataset.search.includes(q);
+      row.hidden = !match;
+      if (match) groupVisible++;
+    });
+    group.hidden = groupVisible === 0;
+    visible += groupVisible;
+  });
+  const none = document.getElementById('tplNoResults');
+  if (none) none.hidden = visible > 0 || !q;
+}
+
+function choreFromTemplate(template) {
+  const schedule = { ...template.schedule, anchorDate: dateKey(startOfToday()), time: null };
+  return {
+    title: template.title,
+    notes: template.notes || '',
+    checklist: template.checklist || [],
+    estimatedMinutes: template.estimatedMinutes,
+    categoryId: template.categoryId,
+    assigneeId: null,
+    frequencyTier: inferFrequencyTier(schedule),
+    schedule,
+  };
+}
+
 // ---------- Modal root ----------
 
 function renderModal() {
   const root = document.getElementById('modalRoot');
-  if (!ui.modal) { root.innerHTML = ''; return; }
+  if (!ui.modal) { root.innerHTML = ''; syncToastPosition(); return; }
   let content = '';
   if (ui.modal.type === 'occurrence') content = renderOccurrenceModalContent(ui.modal.choreId, ui.modal.date);
   else if (ui.modal.type === 'chore') content = renderChoreFormContent(ui.modal.choreId, ui.modal.presetMode);
+  else if (ui.modal.type === 'add-choice') content = renderAddChoiceContent();
+  else if (ui.modal.type === 'template-picker') content = renderTemplatePickerContent();
   root.innerHTML = `<div class="modal-overlay" data-action="overlay"><div class="modal">${content}</div></div>`;
+  if (ui.modal.type === 'template-picker') applyTemplateSearch();
+  syncToastPosition();
 }
 
 function openOccurrenceModal(choreId, date) {
@@ -1272,9 +1737,103 @@ function openChoreModal(choreId, presetMode) {
   ui.modal = { type: 'chore', choreId: choreId || null, presetMode, draft: makeChoreDraft(chore, presetMode) };
   renderModal();
 }
+function openTemplatePicker(multi) {
+  ui.modal = { type: 'template-picker', multi, selected: [], query: '' };
+  renderModal();
+}
 function closeModal() {
   ui.modal = null;
   renderModal();
+}
+
+// ---------- Odhaczanie: wykonane / pominięte / cofnij ----------
+
+/** Niewykonane (pending) wystąpienia obowiązku w trybie 'fixed' sprzed `dateKeyStr`
+ * i sprzed dziś — to one "przepadają" jako pominięte, gdy nowszy termin zostaje
+ * zamknięty (codzienna zmywarka zrobiona dziś nadrabia wczorajszą). */
+function earlierPendingOverdue(chore, dateKeyStr) {
+  if (!chore || chore.schedule.mode !== 'fixed') return [];
+  const today = startOfToday();
+  const target = parseDateKey(dateKeyStr);
+  const end = addUnits(target.getTime() < today.getTime() ? target : today, 'day', -1);
+  const start = addUnits(today, 'day', -OVERDUE_LOOKBACK_DAYS);
+  if (end < start) return [];
+  const vacations = store.getVacations();
+  return generateOccurrencesInRange(chore, start, end)
+    .map((o) => dateKey(o.date))
+    .filter((key) => key !== dateKeyStr && (store.getOverride(chore.id, key)?.status || 'pending') === 'pending'
+      && !isVacationDay(parseDateKey(key), vacations));
+}
+
+/** Zmienia status wystąpienia i pokazuje toast z "Cofnij". Wspólne dla kółka na
+ * liście i przycisków w szczegółach. */
+function setOccurrence(choreId, dateKeyStr, newStatus) {
+  const chore = store.getChore(choreId);
+  if (!chore) return;
+  const members = store.getMembers();
+  const existing = store.getOverride(choreId, dateKeyStr);
+  const snapshots = [store.getOccurrenceSnapshot(choreId, dateKeyStr)];
+  const extra = {};
+  let takenFrom = null;
+
+  // Odhaczasz zadanie przypisane komuś innemu → "przejmujesz" je: liczy się od
+  // teraz jako Twoje (i Twoje punkty) — i toast mówi to wprost.
+  if (newStatus === 'done') {
+    const myMemberId = resolveMyMemberId(members);
+    const effectiveAssignee = existing?.assigneeId ?? chore.assigneeId ?? null;
+    if (myMemberId && effectiveAssignee !== myMemberId) {
+      extra.assigneeId = myMemberId;
+      takenFrom = members.find((m) => m.id === effectiveAssignee) || null;
+    }
+  }
+
+  const earlier = newStatus === 'pending' ? [] : earlierPendingOverdue(chore, dateKeyStr);
+  for (const key of earlier) snapshots.push(store.getOccurrenceSnapshot(choreId, key));
+
+  store.setOccurrenceStatus(choreId, dateKeyStr, newStatus, extra);
+  for (const key of earlier) store.setOccurrenceStatus(choreId, key, 'skipped');
+
+  const parts = [{ done: 'Wykonane', skipped: 'Pominięte', pending: existing?.status === 'skipped' ? 'Przywrócone' : 'Cofnięto wykonanie' }[newStatus]];
+  if (takenFrom) parts.push(`przejęte od: ${takenFrom.name}`);
+  if (earlier.length) parts.push(`${earlier.length} ${plural(earlier.length, 'wcześniejsze pominięte', 'wcześniejsze pominięte', 'wcześniejszych pominiętych')}`);
+
+  ui.justResolvedKey = newStatus === 'pending' ? null : `${choreId}|${dateKeyStr}`;
+  showToast(parts.join(' · '), () => {
+    for (const snap of snapshots.reverse()) store.restoreOccurrenceSnapshot(snap);
+  });
+}
+
+// ---------- Toast ----------
+
+let toastTimer = null;
+
+function showToast(message, undoFn = null) {
+  const root = document.getElementById('toastRoot');
+  if (!root) return;
+  ui.toastUndo = undoFn;
+  root.innerHTML = `<div class="toast">
+    <span class="toast-text">${escapeHtml(message)}</span>
+    ${undoFn ? '<button type="button" class="toast-action" data-action="toast-undo">Cofnij</button>' : ''}
+  </div>`;
+  syncToastPosition();
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(hideToast, 5000);
+}
+
+function hideToast() {
+  clearTimeout(toastTimer);
+  ui.toastUndo = null;
+  const root = document.getElementById('toastRoot');
+  if (root) root.innerHTML = '';
+}
+
+/** Toast siedzi nad dolnym paskiem, gdy ten jest widoczny, a przy modalu i widokach
+ * bez paska — przy samym dole ekranu. */
+function syncToastPosition() {
+  const root = document.getElementById('toastRoot');
+  if (!root) return;
+  const tabbarVisible = ui.route === 'app' && !ui.view && !ui.modal;
+  root.classList.toggle('is-above-tabbar', tabbarVisible);
 }
 
 // ---------- Obsługa zdarzeń (delegacja) ----------
@@ -1291,8 +1850,20 @@ function handleClick(e) {
     case 'close-modal':
       closeModal();
       return;
+    case 'toast-undo': {
+      const undo = ui.toastUndo;
+      hideToast();
+      if (undo) {
+        undo();
+        ui.justResolvedKey = null;
+        if (ui.modal?.type === 'occurrence') renderModal();
+        render();
+      }
+      return;
+    }
     case 'back':
       ui.view = null;
+      ui.resetConfirmOpen = false;
       ui.categoryEditId = null;
       ui.categoryDraft = null;
       ui.templateEditId = null;
@@ -1455,13 +2026,11 @@ function handleClick(e) {
       ui.templateDraft.scheduleMode = el.dataset.mode;
       render();
       return;
-    case 'adjust-template-minutes': {
+    case 'set-template-minutes':
       captureTemplateFormInputs();
-      const delta = Number(el.dataset.delta);
-      ui.templateDraft.estimatedMinutes = Math.max(1, (ui.templateDraft.estimatedMinutes || 15) + delta);
+      ui.templateDraft.estimatedMinutes = Number(el.dataset.minutes);
       render();
       return;
-    }
     case 'save-template': {
       captureTemplateFormInputs();
       const title = ui.templateDraft.title.trim();
@@ -1496,10 +2065,47 @@ function handleClick(e) {
     case 'apply-template':
       openChoreModalFromTemplate(el.dataset.tplid);
       return;
+    case 'open-template-picker':
+      openTemplatePicker(el.dataset.multi === '1');
+      return;
+    case 'toggle-picker-mode':
+      ui.modal.multi = !ui.modal.multi;
+      ui.modal.selected = [];
+      renderModal();
+      return;
+    case 'toggle-template-pick': {
+      const { selected } = ui.modal;
+      const idx = selected.indexOf(el.dataset.tplid);
+      if (idx >= 0) selected.splice(idx, 1);
+      else selected.push(el.dataset.tplid);
+      renderModal();
+      return;
+    }
+    case 'add-picked-templates': {
+      const templates = store.getTemplates();
+      const picked = ui.modal.selected.map((id) => templates.find((t) => t.id === id)).filter(Boolean);
+      for (const t of picked) store.saveChore(choreFromTemplate(t));
+      closeModal();
+      render();
+      if (picked.length) showToast(`Dodano ${picked.length} ${plural(picked.length, 'obowiązek', 'obowiązki', 'obowiązków')}`);
+      return;
+    }
+    case 'manage-templates':
+      closeModal();
+      ui.view = 'templates';
+      ui.templateEditId = null;
+      ui.templateDraft = null;
+      render();
+      scrollContentTop();
+      return;
 
     // ---- Obowiązki: filtr ----
     case 'set-chore-filter':
       ui.choreFilter = el.dataset.filter;
+      render();
+      return;
+    case 'toggle-stats':
+      ui.statsExpanded = !ui.statsExpanded;
       render();
       return;
 
@@ -1511,25 +2117,22 @@ function handleClick(e) {
       ui.selectedDay = ui.selectedDay === el.dataset.date ? null : el.dataset.date;
       render();
       return;
-    case 'toggle-occurrence': {
+    case 'quick-toggle': {
       const { choreid, date } = el.dataset;
-      const chore = store.getChore(choreid);
-      const existingOverride = store.getOverride(choreid, date);
-      const current = existingOverride?.status || 'pending';
-      const newStatus = current === 'done' ? 'pending' : 'done';
-      const extra = {};
-      // Odhaczasz zadanie przypisane komuś innemu → "przejmujesz" je: liczy się od
-      // teraz jako Twoje (i Twoje punkty), zamiast cichego przypisania do wcześniejszej osoby.
-      if (newStatus === 'done') {
-        const myMemberId = resolveMyMemberId(store.getMembers());
-        const effectiveAssignee = existingOverride?.assigneeId ?? chore?.assigneeId ?? null;
-        if (myMemberId && effectiveAssignee !== myMemberId) {
-          extra.assigneeId = myMemberId;
-        }
-      }
-      store.setOccurrenceStatus(choreid, date, newStatus, extra);
-      if (ui.modal?.type === 'occurrence') renderModal();
+      const current = store.getOverride(choreid, date)?.status || 'pending';
+      setOccurrence(choreid, date, current === 'pending' ? 'done' : 'pending');
       render();
+      ui.justResolvedKey = null;
+      return;
+    }
+    case 'set-occurrence': {
+      const { choreid, date, status } = el.dataset;
+      setOccurrence(choreid, date, status);
+      // Wykonane/pominięte zamyka szczegóły (toast i tak daje "Cofnij"); cofnięcie zostawia je otwarte.
+      if (status === 'pending') renderModal();
+      else closeModal();
+      render();
+      ui.justResolvedKey = null;
       return;
     }
     case 'set-my-member':
@@ -1552,6 +2155,10 @@ function handleClick(e) {
 
     // ---- Formularz obowiązku ----
     case 'new-chore':
+      ui.modal = { type: 'add-choice' };
+      renderModal();
+      return;
+    case 'new-chore-blank':
       openChoreModal(null);
       return;
     case 'new-once':
@@ -1581,9 +2188,43 @@ function handleClick(e) {
       render();
       scrollContentTop();
       return;
-    case 'set-schedule-mode':
+    case 'set-preset': {
       captureChoreFormInputs();
-      ui.modal.draft.scheduleMode = el.dataset.mode;
+      const d = ui.modal.draft;
+      const preset = SCHEDULE_PRESETS.find((p) => p.key === el.dataset.preset);
+      d.preset = preset.key;
+      if (preset.unit) {
+        d.unit = preset.unit;
+        d.interval = preset.interval;
+      }
+      // "Co tydzień" od razu pokazuje, w jaki dzień wypada (dzień daty startu).
+      if (d.unit === 'week' && d.weekdays.length === 0 && d.anchorDate) d.weekdays = [parseDateKey(d.anchorDate).getDay()];
+      renderModal();
+      return;
+    }
+    case 'toggle-rolling':
+      captureChoreFormInputs();
+      ui.modal.draft.rolling = !ui.modal.draft.rolling;
+      renderModal();
+      return;
+    case 'toggle-weekday': {
+      captureChoreFormInputs();
+      const day = Number(el.dataset.day);
+      const days = ui.modal.draft.weekdays;
+      const idx = days.indexOf(day);
+      if (idx >= 0) days.splice(idx, 1);
+      else days.push(day);
+      renderModal();
+      return;
+    }
+    case 'toggle-more':
+      captureChoreFormInputs();
+      ui.modal.draft.showMore = !ui.modal.draft.showMore;
+      renderModal();
+      return;
+    case 'toggle-active':
+      captureChoreFormInputs();
+      ui.modal.draft.active = !ui.modal.draft.active;
       renderModal();
       return;
     case 'select-assignee-chip':
@@ -1591,13 +2232,11 @@ function handleClick(e) {
       ui.modal.draft.assigneeId = el.dataset.id || null;
       renderModal();
       return;
-    case 'adjust-minutes': {
+    case 'set-minutes':
       captureChoreFormInputs();
-      const delta = Number(el.dataset.delta);
-      ui.modal.draft.estimatedMinutes = Math.max(1, (ui.modal.draft.estimatedMinutes || 15) + delta);
+      ui.modal.draft.estimatedMinutes = Number(el.dataset.minutes);
       renderModal();
       return;
-    }
     case 'add-checklist-item':
       captureChoreFormInputs();
       ui.modal.draft.checklist.push('');
@@ -1628,12 +2267,39 @@ function handleClick(e) {
       }
       return;
 
-    case 'reset-demo':
-      if (confirm('To usunie wszystkie obecne dane i przywróci przykładowe obowiązki. Kontynuować?')) {
-        store.resetAllData();
-        render();
-      }
+    // ---- Konto: tryb urlopowy i dane ----
+    case 'start-vacation': {
+      const today = dateKey(startOfToday());
+      const until = document.getElementById('vacationUntil')?.value || null;
+      store.startVacation(today, until && until >= today ? until : null);
+      render();
+      showToast('Tryb urlopowy włączony');
       return;
+    }
+    case 'end-vacation':
+      store.endVacation(dateKey(startOfToday()), dateKey(addUnits(startOfToday(), 'day', -1)));
+      render();
+      showToast('Tryb urlopowy wyłączony');
+      return;
+    case 'open-reset-confirm':
+      ui.resetConfirmOpen = true;
+      render();
+      document.getElementById('resetConfirmInput')?.focus();
+      return;
+    case 'cancel-reset':
+      ui.resetConfirmOpen = false;
+      render();
+      return;
+    case 'confirm-reset': {
+      const typed = document.getElementById('resetConfirmInput')?.value.trim().toUpperCase();
+      if (typed !== RESET_CONFIRM_WORD || store.getSession()?.mode === 'google') return;
+      store.resetAllData();
+      ui.resetConfirmOpen = false;
+      ui.choreFilter = 'all';
+      render();
+      showToast('Dane usunięte — wczytano przykładowe');
+      return;
+    }
   }
 }
 
@@ -1654,6 +2320,17 @@ function handleChange(e) {
     store.setOccurrenceStatus(choreid, date, status, { assigneeId: e.target.value || null });
     render();
   }
+  if (e.target.id === 'f-unit' || e.target.id === 'f-interval') {
+    // Jednostka zmienia widoczność dni tygodnia i odmianę etykiet — pełny re-render formularza.
+    captureChoreFormInputs();
+    const d = ui.modal.draft;
+    if (d.unit === 'week' && d.weekdays.length === 0 && d.anchorDate) d.weekdays = [parseDateKey(d.anchorDate).getDay()];
+    renderModal();
+  }
+  if (e.target.id === 'f-anchor') {
+    captureChoreFormInputs();
+    updateSchedulePreview();
+  }
   if (e.target.dataset.action === 'save-calendar-id') {
     store.setCalendarId(e.target.value);
     ui.calendarIdDraft = null;
@@ -1662,52 +2339,62 @@ function handleChange(e) {
   }
 }
 
+function handleInput(e) {
+  const { id } = e.target;
+  if (id === 'resetConfirmInput') {
+    const btn = document.getElementById('resetConfirmBtn');
+    if (btn) btn.disabled = e.target.value.trim().toUpperCase() !== RESET_CONFIRM_WORD;
+  } else if (id === 'tplSearch' && ui.modal?.type === 'template-picker') {
+    ui.modal.query = e.target.value;
+    applyTemplateSearch();
+  } else if (id === 'f-interval' || id === 'f-anchor') {
+    captureChoreFormInputs();
+    updateSchedulePreview();
+  }
+}
+
 function handleSubmit(e) {
   if (e.target.id !== 'choreForm') return;
   e.preventDefault();
   const form = e.target;
+  captureChoreFormInputs();
   const draft = ui.modal.draft;
-  const checklist = [...form.querySelectorAll('[data-role="checklist-value"]')]
-    .map((i) => i.value.trim())
-    .filter(Boolean);
-
-  const unitField = document.getElementById('f-unit');
+  const title = draft.title.trim();
+  if (!title) {
+    document.getElementById('f-title')?.focus();
+    return;
+  }
+  const schedule = scheduleFromDraft(draft);
+  const existing = form.dataset.choreid ? store.getChore(form.dataset.choreid) : null;
   const chore = {
     id: form.dataset.choreid || undefined,
-    title: document.getElementById('f-title').value.trim(),
-    notes: document.getElementById('f-notes').value.trim(),
-    checklist,
+    title,
+    notes: draft.notes.trim(),
+    checklist: draft.checklist.map((i) => i.trim()).filter(Boolean),
     estimatedMinutes: draft.estimatedMinutes,
     categoryId: draft.categoryId || null,
     assigneeId: draft.assigneeId || null,
-    frequencyTier: inferFrequencyTier(draft),
-    schedule: {
-      mode: draft.scheduleMode,
-      unit: unitField ? unitField.value : draft.unit,
-      interval: Math.max(1, Number(document.getElementById('f-interval')?.value) || draft.interval || 1),
-      weekdays: null,
-      anchorDate: document.getElementById('f-anchor').value || dateKey(startOfToday()),
-      time: document.getElementById('f-time').value || null,
-    },
+    // Pole zostaje dla zgodności danych (synchronizacja, starsze wersje), ale zawsze
+    // liczone z harmonogramu — nic w UI już od niego nie zależy.
+    frequencyTier: inferFrequencyTier(schedule),
+    active: draft.active,
+    schedule,
   };
-  if (!chore.title) return;
-  const existing = form.dataset.choreid ? store.getChore(form.dataset.choreid) : null;
-  // Nie zmieniamy kubełka Codzienne/Częste/Rzadkie przy zwykłej edycji istniejącego
-  // obowiązku (żeby drobna korekta interwału nie przerzucała go między sekcjami) —
-  // chyba że tryb harmonogramu przechodzi w/z "Raz", co zawsze wymusza "once".
-  if (draft.scheduleMode === 'once') chore.frequencyTier = 'once';
-  else if (existing && existing.frequencyTier && existing.frequencyTier !== 'once') chore.frequencyTier = existing.frequencyTier;
+  // Zmiana trybu z "od wykonania" na inny zeruje datę ostatniego wykonania, żeby po
+  // powrocie do "od wykonania" nie wrócił nieaktualny termin.
+  if (existing && existing.schedule.mode === 'rolling' && schedule.mode !== 'rolling') chore.lastCompletedAt = null;
   store.saveChore(chore);
   closeModal();
   render();
+  showToast(existing ? (existing.active !== false && !draft.active ? 'Obowiązek wstrzymany' : 'Zapisano zmiany') : 'Dodano obowiązek');
 }
 
-/** Dla nowych obowiązków: sensowne domyślne "wiaderko" (Codzienne/Częste/Rzadkie) na
- * podstawie trybu harmonogramu — użytkownik może to później dostroić edytując interwał. */
-function inferFrequencyTier(draft) {
-  if (draft.scheduleMode === 'once') return 'once';
-  if (draft.scheduleMode === 'rolling') return 'rare';
-  if (draft.unit === 'day' && draft.interval <= 1) return 'daily';
+/** "Wiaderko" częstotliwości zapisywane na obowiązku (daily/frequent/rare/once). */
+function inferFrequencyTier(schedule) {
+  if (schedule.mode === 'once') return 'once';
+  if (schedule.mode === 'rolling') return 'rare';
+  if (schedule.unit === 'day' && schedule.interval <= 1) return 'daily';
+  if (schedule.unit === 'month') return 'rare';
   return 'frequent';
 }
 
@@ -1758,6 +2445,7 @@ function init() {
 
   document.addEventListener('click', handleClick);
   document.addEventListener('change', handleChange);
+  document.addEventListener('input', handleInput);
   document.addEventListener('submit', handleSubmit);
 
   render();

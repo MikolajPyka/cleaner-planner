@@ -33,9 +33,15 @@ przetestować responsywność na realnym urządzeniu.
   wklejeniu własnego Client ID — patrz „Publikacja pod testy na telefonie” niżej; bez
   niego pokazuje uczciwą notatkę zamiast udawać logowanie) i „Kontynuuj lokalnie” (tryb
   bez logowania, dokładnie taki jak dotychczas).
-- **Start (dashboard)** — powitanie, karty statystyk (dziś wykonane, passa dni,
-  punkty, % tygodnia), pasek szybkich akcji (+ Obowiązek, + Jednorazowe), lista
-  zaległych/dzisiejszych/najbliższych zadań z kolorowymi znacznikami kategorii.
+- **Start (dashboard)** — na górze lista zaległych (zgrupowanych per obowiązek:
+  „Zaległe od 5 dni”) i dzisiejszych zadań; statystyki zwinięte do jednego paska
+  (dziś · passa domu · punkty), rozwijanego do poziomu i pełnych kart; „+” otwiera
+  wybór: z szablonu / od zera / jednorazowe.
+- **Odhaczanie jednym tapnięciem** — kółko przy zadaniu od razu oznacza je jako
+  wykonane (toast z „Cofnij”), reszta wiersza otwiera szczegóły. W szczegółach jest
+  też „Pomiń ten termin” — pominięte nie daje punktów, ale nie przerywa passy.
+  Zamknięcie nowszego terminu obowiązku o stałym rytmie oznacza jego starsze,
+  niewykonane terminy jako pominięte (dzisiejsza zmywarka nadrabia wczorajszą).
 - **Grywalizacja** — punkty za wykonane zadania (proporcjonalnie do szacowanego
   czasu), passa kolejnych „czystych” dni, poziomy z żartobliwymi tytułami
   (Nowicjusz sprzątania → Legenda porządku). Logika w `js/gamification.js`,
@@ -56,8 +62,11 @@ przetestować responsywność na realnym urządzeniu.
 - **Konto** — jeden ekran zbierający: kartę profilu, status połączenia z kalendarzem
   Google (Faza 2), listę domowników z kolorem/inicjałami (dodawanie/usuwanie/zmiana
   koloru), przełącznik wyglądu (system/jasny/ciemny), skrót do kategorii i wylogowanie.
-- Dane demonstracyjne ładują się same przy pierwszym uruchomieniu — edytuj je albo
-  wyczyść przyciskiem „Zresetuj dane demonstracyjne” w zakładce Obowiązki.
+- **Tryb urlopowy** (Konto) — dla całego domu: dni urlopu nie tworzą zaległości i nie
+  przerywają passy. Obowiązek można też wstrzymać pojedynczo (edycja → „Wstrzymaj”).
+- Dane demonstracyjne ładują się same przy pierwszym uruchomieniu. Wyczyścić je można
+  w Konto → Dane („Usuń wszystkie dane i wczytaj przykładowe”, z potwierdzeniem
+  wpisaniem słowa USUŃ; w trybie Google opcja jest wyłączona, bo dane są wspólne).
 
 ## Struktura projektu
 
@@ -197,9 +206,6 @@ albo custom scheme) trzeba będzie dodać osobno do listy autoryzowanych źróde
 - Brak rotacji wykonawców (round-robin) — obowiązek ma jednego domyślnego wykonawcę,
   zmienianego ręcznie per wystąpienie.
 - Brak powiadomień (push/natywne) — sensowne dopiero po przejściu na Capacitor.
-- Tygodniowy harmonogram „w wybrane dni tygodnia” jest przygotowany w silniku
-  (`recurrence.js`), ale nie ma jeszcze pola w formularzu — na razie częstotliwość
-  ustawia się jako „co N dni/tygodni/miesięcy” od dowolnej daty startowej.
 - Grywalizacja jest celowo prosta (punkty + passa + poziom) — bez odznak/osiągnięć,
   żeby nie rozrastać MVP. Łatwo dobudować w `js/gamification.js`, jeśli się sprawdzi.
 - „Kontynuuj z Google” loguje naprawdę (po wklejeniu Client ID), ale to na razie tylko

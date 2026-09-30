@@ -56,15 +56,18 @@ function generateFixedDates(chore, rangeStart, rangeEnd) {
   if (schedule.unit === 'week' && schedule.weekdays && schedule.weekdays.length > 0) {
     // Iterujemy tydzień po tygodniu od zakotwiczenia, co `interval` tygodni,
     // i w każdym pasującym tygodniu dodajemy wskazane dni tygodnia.
+    // `weekdays` trzyma numery jak Date.getDay() (0 = niedziela), ale tydzień liczymy
+    // od poniedziałku — tak jak w formularzu i kalendarzu — żeby "co 2 tygodnie, pn i nd"
+    // oznaczało poniedziałek i niedzielę TEGO SAMEGO tygodnia.
     const weekStart = new Date(anchor);
-    weekStart.setDate(weekStart.getDate() - weekStart.getDay()); // niedziela jako start tygodnia
+    weekStart.setDate(weekStart.getDate() - ((weekStart.getDay() + 6) % 7));
     let cursor = new Date(weekStart);
     let guard = 0;
     while (cursor.getTime() <= rangeEnd.getTime() && guard < 5000) {
       guard++;
       for (const wd of schedule.weekdays) {
         const day = new Date(cursor);
-        day.setDate(day.getDate() + wd);
+        day.setDate(day.getDate() + ((wd + 6) % 7));
         if (isSameOrAfter(day, rangeStart) && isSameOrBefore(day, rangeEnd) && isSameOrAfter(day, anchor)) {
           dates.push(day);
         }
@@ -124,6 +127,15 @@ export function generateOccurrencesInRange(chore, rangeStart, rangeEnd) {
     date,
     overdue: false,
   }));
+}
+
+/** Najbliższy termin obowiązku w dniu `from` lub później (do ~2 lat do przodu) —
+ * na potrzeby zdania-podglądu w formularzu. Zwraca null, jeśli nic nie wypada. */
+export function nextOccurrenceDate(chore, from) {
+  if (chore.schedule.mode === 'once') return parseDateKey(chore.schedule.anchorDate);
+  if (chore.schedule.mode === 'rolling') return getRollingDueDate(chore);
+  const end = addUnits(from, 'month', 25);
+  return generateFixedDates(chore, from, end)[0] || null;
 }
 
 /** Generuje wystąpienia dla wielu obowiązków naraz, posortowane chronologicznie. */

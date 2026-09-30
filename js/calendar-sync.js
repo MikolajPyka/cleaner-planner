@@ -182,6 +182,7 @@ export async function pushCatalog() {
     categories: store.getCategories(),
     chores: store.getChores(),
     templates: store.getTemplates(), // biblioteka szablonów obowiązków — patrz storage.js
+    household: store.getHousehold(), // ustawienia wspólne dla domu (tryb urlopowy)
     updatedAt: new Date().toISOString(),
   };
   const existing = await findCatalogEvent(calendarId);
@@ -231,7 +232,8 @@ function occurrenceEventBody(chore, date, category, member, override) {
   const status = override?.status || 'pending';
   const assigneeId = override?.assigneeId ?? chore.assigneeId ?? null;
   const isDone = status === 'done';
-  const title = `${isDone ? '✓ ' : ''}${chore.title}`;
+  const isSkipped = status === 'skipped';
+  const title = `${isDone ? '✓ ' : isSkipped ? '↷ ' : ''}${chore.title}`;
   const descLines = [
     chore.notes || '',
     member ? `Wykonawca: ${member.name}` : 'Wykonawca: ktokolwiek',
@@ -243,8 +245,8 @@ function occurrenceEventBody(chore, date, category, member, override) {
   const body = {
     summary: title,
     description: descLines.join('\n'),
-    transparency: isDone ? 'transparent' : 'opaque',
-    colorId: isDone ? '8' : (category ? nearestColorId(category.colorHex) : undefined),
+    transparency: isDone || isSkipped ? 'transparent' : 'opaque',
+    colorId: isDone || isSkipped ? '8' : (category ? nearestColorId(category.colorHex) : undefined),
     extendedProperties: {
       shared: {
         k: 'cp_occurrence',

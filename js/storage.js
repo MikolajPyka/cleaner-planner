@@ -16,6 +16,7 @@ const KEYS = {
   catalogRemoteVersion: 'cp_catalog_remote_version', // ostatnio pobrany znacznik wersji katalogu z kalendarza
   templates: 'cp_templates', // biblioteka szablonów obowiązków (patrz "Szablony" niżej)
   templatesSeeded: 'cp_templates_seeded_v1',
+  household: 'cp_household', // ustawienia wspólne dla całego domu, np. { vacations: [{ from, until }] }
 };
 
 function read(key, fallback) {
@@ -233,8 +234,10 @@ export function getOverride(choreId, dateKey) {
 }
 
 /**
- * Ustawia status wystąpienia. Jeśli status === 'done' i obowiązek jest w trybie
- * 'rolling', aktualizuje też lastCompletedAt na obowiązku, żeby przesunąć kolejny termin.
+ * Ustawia status wystąpienia: 'pending' | 'done' | 'skipped'. "Pominięte" zamyka
+ * wystąpienie bez punktów, ale nie przerywa passy (patrz gamification.js).
+ * Jeśli obowiązek jest w trybie 'rolling', 'done' i 'skipped' aktualizują też
+ * lastCompletedAt, żeby przesunąć kolejny termin; powrót do 'pending' go cofa.
  */
 export function setOccurrenceStatus(choreId, dateKey, status, extra = {}) {
   const overrides = getOverrides();
@@ -251,12 +254,85 @@ export function setOccurrenceStatus(choreId, dateKey, status, extra = {}) {
 
   const chore = getChore(choreId);
   if (chore && chore.schedule.mode === 'rolling') {
-    if (status === 'done') {
+    if (status === 'done' || status === 'skipped') {
       saveChore({ ...chore, lastCompletedAt: dateKey });
     } else if (chore.lastCompletedAt === dateKey) {
       saveChore({ ...chore, lastCompletedAt: null });
     }
   }
+}
+
+/** Stan wystąpienia sprzed zmiany — do "Cofnij" w toaście. Obejmuje też
+ * lastCompletedAt obowiązku, bo dla trybu 'rolling' zmiana statusu go przesuwa, a
+ * zwykłe ustawienie 'pending' nie przywróciłoby wcześniejszej daty wykonania. */
+export function getOccurrenceSnapshot(choreId, dateKey) {
+  const override = getOverride(choreId, dateKey);
+  return {
+    choreId,
+    dateKey,
+    override: override ? { ...override } : null,
+    lastCompletedAt: getChore(choreId)?.lastCompletedAt ?? null,
+  };
+}
+
+export function restoreOccurrenceSnapshot(snapshot) {
+  const { choreId, dateKey } = snapshot;
+  const overrides = getOverrides();
+  const key = overrideKey(choreId, dateKey);
+  if (snapshot.override) overrides[key] = snapshot.override;
+  else delete overrides[key];
+  write(KEYS.overrides, overrides);
+  notifyWrite('occurrence', { choreId, dateKey, override: overrides[key] || null });
+
+  const chore = getChore(choreId);
+  if (chore && chore.schedule.mode === 'rolling' && chore.lastCompletedAt !== snapshot.lastCompletedAt) {
+    saveChore({ ...chore, lastCompletedAt: snapshot.lastCompletedAt });
+  }
+}
+
+// ---------- Ustawienia domu (tryb urlopowy) ----------
+// Wspólne dla wszystkich domowników — dlatego jadą w katalogu synchronizowanym z
+// kalendarzem (patrz pushCatalog w calendar-sync.js), a nie w sesji tego urządzenia.
+// Urlopy to lista okresów { from, until } ('YYYY-MM-DD', until === null = do odwołania):
+// zakończone zostają w historii, żeby dni z dawnego urlopu nie wróciły jako zaległe
+// ani nie przerwały passy po włączeniu kolejnego.
+
+const MAX_VACATIONS = 12;
+
+export function getHousehold() {
+  return read(KEYS.household, {});
+}
+
+function saveHousehold(household) {
+  write(KEYS.household, household);
+  notifyWrite('household', household);
+}
+
+export function getVacations() {
+  return getHousehold().vacations || [];
+}
+
+/** Urlop obejmujący dany dzień (albo null). */
+export function getActiveVacation(todayKey) {
+  return getVacations().find((v) => v.from <= todayKey && (!v.until || v.until >= todayKey)) || null;
+}
+
+export function startVacation(fromKey, untilKey) {
+  const vacations = [...getVacations(), { from: fromKey, until: untilKey || null }].slice(-MAX_VACATIONS);
+  saveHousehold({ ...getHousehold(), vacations });
+}
+
+/** Kończy urlop trwający w `todayKey`: zaczęty wcześniej kończy się wczoraj (dni
+ * urlopu zostają usprawiedliwione), zaczęty dziś po prostu znika. */
+export function endVacation(todayKey, yesterdayKey) {
+  const vacations = getVacations()
+    .map((v) => {
+      const active = v.from <= todayKey && (!v.until || v.until >= todayKey);
+      if (!active) return v;
+      return v.from < todayKey ? { ...v, until: yesterdayKey } : null;
+    })
+    .filter(Boolean);
+  saveHousehold({ ...getHousehold(), vacations });
 }
 
 // ---------- Motyw ----------
@@ -366,7 +442,7 @@ export function claimMemberForIdentity(profile) {
 // presetu) i BEZ `schedule.anchorDate`/`time` (data startowa nie ma sensu w oderwaniu
 // od konkretnego zastosowania — appka wypełnia ją dopiero w formularzu, na dzień
 // dzisiejszy, patrz `makeDraftFromTemplate()` w app.js). Szablony NIE są danymi demo:
-// zostają nawet po "Zresetuj dane demonstracyjne" i są w pełni edytowalne/usuwalne,
+// zostają nawet po "Usuń wszystkie dane i wczytaj przykładowe" (Konto → Dane) i są w pełni edytowalne/usuwalne,
 // łącznie z tymi wbudowanymi (`builtIn` to tu tylko informacja, nie ochrona przed
 // edycją/usunięciem — w odróżnieniu od wbudowanych Kategorii/Pomieszczeń).
 
@@ -493,11 +569,12 @@ export function setCatalogRemoteVersion(version) {
  * urządzenia mogły wypchnąć katalog sprzed dodania szablonów) — brak klucza zostawia
  * lokalną bibliotekę szablonów nietkniętą zamiast ją czyścić.
  */
-export function replaceCatalogFromRemote({ members, categories, chores, templates }) {
+export function replaceCatalogFromRemote({ members, categories, chores, templates, household }) {
   if (members) write(KEYS.members, members);
   if (categories) write(KEYS.categories, categories);
   if (chores) write(KEYS.chores, chores);
   if (templates) write(KEYS.templates, templates);
+  if (household) write(KEYS.household, household);
 }
 
 /** Jak wyżej, ale dla mapy statusów wystąpień w danym oknie dat (merge, nie replace
@@ -618,5 +695,6 @@ export function resetAllData() {
   localStorage.removeItem(KEYS.overrides);
   localStorage.removeItem(KEYS.categories);
   localStorage.removeItem(KEYS.seeded);
+  localStorage.removeItem(KEYS.household);
   ensureDemoData();
 }
